@@ -1,0 +1,123 @@
+# Builds the Artemis Watch firmware in the cloud: no PC needed.
+#
+# How it works:
+#  - takes CircuitMess firmware at BASE_COMMIT (the base all our patches are made against)
+#  - applies the newest patches/artemis-calendar-v*.patch from this repo
+#  - builds with the exact ESP-IDF commit CircuitMess uses (+ their ESP-IDF/JPEGDEC/LovyanGFX patches)
+#  - publishes the result as the release "firmware-latest":
+#      artemis-full.bin       whole flash image, write at 0x0 (USB flashing)
+#      Artemis-Firmware.bin   app only (for over-the-air updates later)
+#
+# Runs on every push, or by hand: Actions -> Build firmware -> Run workflow.
+
+name: Build firmware
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BASE_COMMIT: 5b1ec558698f6103ce7ebe25714c0a87a0460a9d   # CircuitMess firmware v2.2 (2026-08-10)
+  IDF_COMMIT: 3a45d4e949a174e8829a2e4c86c421b030ceac5a    # ESP-IDF version CircuitMess builds with
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout this repo (workflow + patches)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Firmware sources at the patch base
+        run: |
+          # Perse-Common is listed in .gitmodules with an SSH url; use HTTPS instead
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git cat-file -e "$BASE_COMMIT^{commit}" 2>/dev/null || \
+            git fetch https://github.com/CircuitMess/GC_Artemis-Firmware.git "$BASE_COMMIT"
+          git worktree add --detach "$RUNNER_TEMP/fw" "$BASE_COMMIT"
+          cd "$RUNNER_TEMP/fw"
+          git submodule update --init --recursive
+
+      - name: Cache ESP-IDF
+        id: idf-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/esp-idf
+            ~/.espressif
+          key: idf-${{ env.IDF_COMMIT }}-esp32s3-v1
+
+      - name: Install ESP-IDF
+        if: steps.idf-cache.outputs.cache-hit != 'true'
+        run: |
+          git init ~/esp-idf
+          cd ~/esp-idf
+          git remote add origin https://github.com/espressif/esp-idf.git
+          git fetch --depth 1 origin "$IDF_COMMIT"
+          git checkout --detach FETCH_HEAD
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          ./install.sh esp32s3
+          # setuptools 82 removed pkg_resources, which IDF 5.1 still imports
+          ~/.espressif/python_env/idf5.1_py*_env/bin/python -m pip install "setuptools<82"
+
+      - name: Apply patches
+        run: |
+          FW="$RUNNER_TEMP/fw"
+          apply_once() {   # $1 = repo dir, $2 = patch file
+            if git -C "$1" apply --reverse --check "$2" 2>/dev/null; then
+              echo "already applied: $2"
+            else
+              git -C "$1" apply "$2"
+              echo "applied: $2"
+            fi
+          }
+          apply_once ~/esp-idf "$FW/ESP-IDF.patch"
+          apply_once "$FW/components/JPEGDEC" "$FW/JPEGDEC.patch"
+          apply_once "$FW/components/LovyanGFX" "$FW/LovyanGFX.patch"
+
+          # Only the newest calendar patch counts: each one contains all previous changes
+          PATCH=$(ls patches/artemis-calendar-v*.patch 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$PATCH" ]; then
+            git -C "$FW" apply "$GITHUB_WORKSPACE/$PATCH"
+            echo "Calendar patch: $PATCH"
+          else
+            echo "No calendar patch found in patches/ - building stock firmware"
+          fi
+          echo "PATCH_NAME=$(basename "${PATCH:-stock}")" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          . ~/esp-idf/export.sh
+          cd "$RUNNER_TEMP/fw"
+          idf.py build
+          cd build
+          esptool.py --chip esp32s3 merge_bin -o artemis-full.bin @flash_args
+          ls -l *.bin
+
+      - name: Collect files
+        run: |
+          mkdir -p out
+          B="$RUNNER_TEMP/fw/build"
+          cp "$B/artemis-full.bin" "$B/Artemis-Firmware.bin" out/
+          echo "$PATCH_NAME, built $(date -u +'%Y-%m-%d %H:%M UTC') from ${GITHUB_SHA::7}" > out/version.txt
+          cat out/version.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artemis-firmware
+          path: out/
+
+      - name: Publish release "firmware-latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view firmware-latest >/dev/null 2>&1 || \
+            gh release create firmware-latest --prerelease --title "Latest firmware build" \
+              --notes "Built automatically by GitHub Actions. Files are replaced on every build; see version.txt."
+          gh release upload firmware-latest out/* --clobber
