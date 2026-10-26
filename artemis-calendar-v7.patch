@@ -1,0 +1,3468 @@
+diff --git a/main/main.cpp b/main/main.cpp
+index 6dbf699..189077a 100644
+--- a/main/main.cpp
++++ b/main/main.cpp
+@@ -19,6 +19,7 @@
+ #include "BLE/Client.h"
+ #include "BLE/Server.h"
+ #include "Notifs/Phone.h"
++#include "Calendar/CalendarReminders.h"
+ #include "LV_Interface/LVGL.h"
+ #include "LV_Interface/FSLVGL.h"
+ #include "LV_Interface/InputLVGL.h"
+@@ -174,6 +175,7 @@ void init(){
+ 	auto phone = new Phone(server, client);
+ 	server->start();
+ 	Services.set(Service::Phone, phone);
++	CalendarReminders::start();
+ 
+ 	srand(esp_random());
+ 
+diff --git a/main/src/Calendar/CalendarReminders.cpp b/main/src/Calendar/CalendarReminders.cpp
+new file mode 100644
+index 0000000..82f89f1
+--- /dev/null
++++ b/main/src/Calendar/CalendarReminders.cpp
+@@ -0,0 +1,76 @@
++#include "CalendarReminders.h"
++#include "CalendarStore.h"
++#include "Notifs/Phone.h"
++#include "Services/Time.h"
++#include "Util/Services.h"
++#include "NightMode.h"
++#include "Services/StatusCenter.h"
++#include "Services/BacklightBrightness.h"
++#include "Settings/Settings.h"
++#include <cstdio>
++#include <ctime>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++
++static Notif toNotif(const CalEvent& e){
++	char when[48];
++	if(e.allDay){
++		snprintf(when, sizeof(when), "All day");
++	}else{
++		const time_t s = (time_t) e.start, en = (time_t) e.end;
++		tm ts = {}, te = {};
++		gmtime_r(&s, &ts);
++		gmtime_r(&en, &te);
++		snprintf(when, sizeof(when), "%02d:%02d-%02d:%02d", ts.tm_hour, ts.tm_min, te.tm_hour, te.tm_min);
++	}
++
++	std::string msg = when;
++	if(!e.location.empty()) msg += " @ " + e.location;
++
++	return Notif{
++		.uid = Phone::LocalNotifBit | (e.id & ~Phone::LocalNotifBit),
++		.title = e.title,
++		.message = msg,
++		.appID = "Calendar",
++		.category = Notif::Category::Schedule,
++	};
++}
++
++static void applyNightMode(bool night){
++	if(auto status = (StatusCenter*) Services.get(Service::Status)) status->updateLED();
++	auto bl = (BacklightBrightness*) Services.get(Service::Backlight);
++	auto settings = (Settings*) Services.get(Service::Settings);
++	if(bl != nullptr && settings != nullptr && bl->isOn()){
++		bl->setBrightness(night ? 0 : settings->get().screenBrightness);
++	}
++}
++
++static void reminderTask(void*){
++	vTaskDelay(pdMS_TO_TICKS(5000));
++	bool night = false;
++	while(true){
++		// Night mode (22:00-06:00): switch LEDs and brightness the moment the hour flips
++		if(NightMode::active() != night){
++			night = !night;
++			applyNightMode(night);
++		}
++
++		auto ts = (Time*) Services.get(Service::Time);
++		auto phone = (Phone*) Services.get(Service::Phone);
++		if(ts != nullptr && phone != nullptr){
++			tm t = ts->getTime();
++			if(t.tm_year + 1900 >= 2024){                  // clock was set by a phone at least once
++				const int64_t now = (int64_t) mktime(&t);  // device TZ is UTC -> "local epoch"
++				for(const auto& e : CalendarStore::get().dueReminders(now)){
++					CalendarStore::get().pushAlert(e, now);   // full-screen alert, picked up by the lock screen
++					phone->addLocal(toNotif(e));              // beep + wake + entry in the notification list
++				}
++			}
++		}
++		vTaskDelay(pdMS_TO_TICKS(15000));
++	}
++}
++
++void CalendarReminders::start(){
++	xTaskCreate(reminderTask, "CalRemind", 4096, nullptr, 3, nullptr);
++}
+diff --git a/main/src/Calendar/CalendarReminders.h b/main/src/Calendar/CalendarReminders.h
+new file mode 100644
+index 0000000..65a5025
+--- /dev/null
++++ b/main/src/Calendar/CalendarReminders.h
+@@ -0,0 +1,10 @@
++#ifndef ARTEMIS_FIRMWARE_CALENDARREMINDERS_H
++#define ARTEMIS_FIRMWARE_CALENDARREMINDERS_H
++
++// Background task: every 15 s checks CalendarStore and raises reminders as local
++// watch notifications, so they fire even when the phone is out of range.
++namespace CalendarReminders {
++void start();
++}
++
++#endif //ARTEMIS_FIRMWARE_CALENDARREMINDERS_H
+diff --git a/main/src/Calendar/CalendarStore.cpp b/main/src/Calendar/CalendarStore.cpp
+new file mode 100644
+index 0000000..9b03437
+--- /dev/null
++++ b/main/src/Calendar/CalendarStore.cpp
+@@ -0,0 +1,383 @@
++#include "CalendarStore.h"
++#include <algorithm>
++#include <cstdio>
++#include <esp_log.h>
++
++static const char* TAG = "Calendar";
++
++static void clip(std::string& s, size_t max){
++	if(s.size() > max) s.resize(max);
++}
++
++static bool byStart(const CalEvent& a, const CalEvent& b){
++	return a.start < b.start;
++}
++
++CalendarStore& CalendarStore::get(){
++	static CalendarStore instance;
++	return instance;
++}
++
++CalendarStore::CalendarStore(){
++	events.reserve(MaxEvents);
++	load();
++}
++
++int64_t CalendarStore::reminderAt(const CalEvent& e){
++	if(e.allDay) return e.start + 9 * 3600;
++	return e.start - (int64_t) e.remindMin * 60;
++}
++
++// ---- phone sync ------------------------------------------------------------------------------
++
++void CalendarStore::beginSync(){
++	std::lock_guard lock(mtx);
++	staging.clear();
++	staging.reserve(MaxEvents);
++	syncing = true;
++}
++
++void CalendarStore::stage(const CalEvent& ev){
++	std::lock_guard lock(mtx);
++	if(!syncing || staging.size() >= MaxEvents) return;
++	CalEvent e = ev;
++	clip(e.title, MaxTitle);
++	clip(e.location, MaxLocation);
++	staging.push_back(std::move(e));
++}
++
++void CalendarStore::commitSync(){
++	{
++		std::lock_guard lock(mtx);
++		if(!syncing) return;
++		syncing = false;
++
++		// Keep tasks started on the watch until the phone confirms them...
++		for(const auto& e : events){
++			if((e.id & LocalIdBit) && hasPendingStart(e.id) && staging.size() < MaxEvents){
++				staging.push_back(e);
++			}
++		}
++		// ...and keep finishes / cancels the phone hasn't processed yet
++		for(const auto& p : pend){
++			for(auto& e : staging){
++				if(e.id != p.eventId) continue;
++				if(p.type == PendingAction::Type::End) e.end = std::max(p.time, e.start + 60);
++				else if(p.type == PendingAction::Type::Status) e.cancelled = p.status == 1;
++			}
++		}
++
++		events.swap(staging);
++		staging.clear();
++		staging.shrink_to_fit();
++		std::sort(events.begin(), events.end(), byStart);
++		save();
++		ESP_LOGI(TAG, "Sync committed, %u events", (unsigned) events.size());
++	}
++	rev++;
++}
++
++void CalendarStore::remove(uint32_t id){
++	{
++		std::lock_guard lock(mtx);
++		const auto before = events.size();
++		std::erase_if(events, [id](const CalEvent& e){ return e.id == id; });
++		if(events.size() == before) return;
++		save();
++	}
++	rev++;
++}
++
++void CalendarStore::beginTemplates(){
++	std::lock_guard lock(mtx);
++	tplStaging.clear();
++	tplSyncing = true;
++}
++
++void CalendarStore::stageTemplate(const TaskTemplate& tpl){
++	std::lock_guard lock(mtx);
++	if(!tplSyncing || tplStaging.size() >= MaxTemplates) return;
++	TaskTemplate t = tpl;
++	clip(t.title, MaxTitle);
++	if(t.durationMin == 0) t.durationMin = 30;
++	tplStaging.push_back(std::move(t));
++}
++
++void CalendarStore::commitTemplates(){
++	{
++		std::lock_guard lock(mtx);
++		if(!tplSyncing) return;
++		tplSyncing = false;
++		tpls.swap(tplStaging);
++		tplStaging.clear();
++		save();
++	}
++	rev++;
++}
++
++void CalendarStore::ack(uint32_t seq){
++	std::lock_guard lock(mtx);
++	const auto before = pend.size();
++	std::erase_if(pend, [seq](const PendingAction& p){ return p.seq == seq; });
++	if(pend.size() != before) save();
++}
++
++bool CalendarStore::hasPendingStart(uint32_t eventId) const{
++	return std::any_of(pend.begin(), pend.end(), [eventId](const PendingAction& p){
++		return p.type == PendingAction::Type::Start && p.eventId == eventId;
++	});
++}
++
++// ---- queries ---------------------------------------------------------------------------------
++
++std::vector<CalEvent> CalendarStore::upcoming(int64_t nowLocal, size_t max) const{
++	std::lock_guard lock(mtx);
++	std::vector<CalEvent> out;
++	out.reserve(std::min(max, events.size()));
++	for(const auto& e : events){
++		if(e.end <= nowLocal) continue;
++		out.push_back(e);
++		if(out.size() >= max) break;
++	}
++	return out;
++}
++
++const CalEvent* CalendarStore::currentLocked(int64_t nowLocal) const{
++	const CalEvent* best = nullptr;
++	for(const auto& e : events){
++		if(e.allDay || e.cancelled || e.start > nowLocal || e.end <= nowLocal) continue;
++		if(best == nullptr || e.start >= best->start) best = &e;
++	}
++	return best;
++}
++
++std::optional<CalEvent> CalendarStore::current(int64_t nowLocal) const{
++	std::lock_guard lock(mtx);
++	const auto* e = currentLocked(nowLocal);
++	if(e == nullptr) return std::nullopt;
++	return *e;
++}
++
++std::vector<TaskTemplate> CalendarStore::templates() const{
++	std::lock_guard lock(mtx);
++	return tpls;
++}
++
++std::vector<PendingAction> CalendarStore::pending() const{
++	std::lock_guard lock(mtx);
++	return pend;
++}
++
++// ---- watch actions ---------------------------------------------------------------------------
++
++bool CalendarStore::startTask(uint32_t tplId, int64_t nowLocal){
++	{
++		std::lock_guard lock(mtx);
++		auto tpl = std::find_if(tpls.begin(), tpls.end(), [tplId](const TaskTemplate& t){ return t.id == tplId; });
++		if(tpl == tpls.end() || pend.size() >= MaxPending) return false;
++
++		CalEvent e;
++		e.id = LocalIdBit | (nextLocalId++ & ~LocalIdBit);
++		e.start = nowLocal;
++		e.end = nowLocal + (int64_t) tpl->durationMin * 60;
++		e.title = tpl->title;
++		e.icon = tpl->icon;
++		e.color = tpl->color;
++
++		if(events.size() >= MaxEvents){
++			// drop the furthest-away event; the phone will push the full set again
++			events.erase(std::max_element(events.begin(), events.end(), byStart));
++		}
++		events.push_back(e);
++		std::sort(events.begin(), events.end(), byStart);
++
++		pend.push_back({ PendingAction::Type::Start, nextSeq++, e.id, tplId, nowLocal });
++		save();
++	}
++	rev++;
++	return true;
++}
++
++bool CalendarStore::finishCurrent(int64_t nowLocal){
++	{
++		std::lock_guard lock(mtx);
++		if(pend.size() >= MaxPending) return false;
++		const auto* cur = currentLocked(nowLocal);
++		if(cur == nullptr) return false;
++
++		auto& e = const_cast<CalEvent&>(*cur);
++		e.end = std::max(nowLocal, e.start + 60);
++		pend.push_back({ PendingAction::Type::End, nextSeq++, e.id, 0, e.end });
++		save();
++	}
++	rev++;
++	return true;
++}
++
++bool CalendarStore::setStatus(uint32_t eventId, bool cancelled){
++	{
++		std::lock_guard lock(mtx);
++		if(pend.size() >= MaxPending) return false;
++		auto e = std::find_if(events.begin(), events.end(), [eventId](const CalEvent& ev){ return ev.id == eventId; });
++		if(e == events.end()) return false;
++		e->cancelled = cancelled;
++		PendingAction p;
++		p.type = PendingAction::Type::Status;
++		p.seq = nextSeq++;
++		p.eventId = eventId;
++		p.status = cancelled ? 1 : 0;
++		pend.push_back(p);
++		save();
++	}
++	rev++;
++	return true;
++}
++
++void CalendarStore::pushAlert(const CalEvent& e, int64_t nowLocal){
++	std::lock_guard lock(mtx);
++	if(alerts.size() >= 4) alerts.erase(alerts.begin());
++	alerts.emplace_back(e, nowLocal);
++}
++
++std::optional<CalEvent> CalendarStore::takeAlert(int64_t nowLocal){
++	std::lock_guard lock(mtx);
++	while(!alerts.empty()){
++		auto [e, at] = alerts.front();
++		alerts.erase(alerts.begin());
++		if(nowLocal - at <= 10 * 60) return e;
++	}
++	return std::nullopt;
++}
++
++std::vector<CalEvent> CalendarStore::dueReminders(int64_t nowLocal){
++	std::lock_guard lock(mtx);
++	std::vector<CalEvent> out;
++
++	// First run, clock moved backwards, or a long gap: don't replay old reminders
++	if(lastReminderCheck == 0 || nowLocal < lastReminderCheck){
++		lastReminderCheck = nowLocal;
++		return out;
++	}
++	const int64_t since = std::max(lastReminderCheck, nowLocal - 15 * 60);
++
++	for(const auto& e : events){
++		if(e.remindMin < 0 || e.cancelled) continue;
++		const int64_t at = reminderAt(e);
++		if(at > since && at <= nowLocal) out.push_back(e);
++	}
++	lastReminderCheck = nowLocal;
++	return out;
++}
++
++// ---- persistence -----------------------------------------------------------------------------
++
++namespace {
++struct Writer {
++	FILE* f;
++	template<typename T> void put(const T& v){ fwrite(&v, sizeof(T), 1, f); }
++	void str(const std::string& s){
++		const uint8_t n = std::min<size_t>(s.size(), 255);
++		put(n);
++		fwrite(s.data(), 1, n, f);
++	}
++};
++
++struct Reader {
++	FILE* f;
++	bool ok = true;
++	template<typename T> void get(T& v){ if(ok && fread(&v, sizeof(T), 1, f) != 1) ok = false; }
++	void str(std::string& s){
++		uint8_t n = 0;
++		get(n);
++		if(!ok) return;
++		s.resize(n);
++		if(n && fread(s.data(), 1, n, f) != n) ok = false;
++	}
++};
++}
++
++void CalendarStore::load(){
++	FILE* f = fopen(Path, "rb");
++	if(f == nullptr) return;
++	Reader r{ f };
++
++	uint32_t magic = 0;
++	r.get(magic);
++	if(!r.ok || magic != Magic){
++		fclose(f);
++		ESP_LOGW(TAG, "Ignoring old or invalid %s", Path);
++		return;
++	}
++	r.get(nextSeq);
++	r.get(nextLocalId);
++
++	uint32_t count = 0;
++	r.get(count);
++	for(uint32_t i = 0; r.ok && i < std::min<uint32_t>(count, MaxEvents); i++){
++		CalEvent e;
++		uint8_t allDay = 0;
++		uint8_t cancelled = 0;
++		r.get(e.id); r.get(e.start); r.get(e.end); r.get(allDay); r.get(e.remindMin);
++		r.get(e.icon); r.get(e.color); r.get(cancelled);
++		r.str(e.title); r.str(e.location);
++		e.allDay = allDay != 0;
++		e.cancelled = cancelled != 0;
++		if(r.ok) events.push_back(std::move(e));
++	}
++
++	r.get(count);
++	for(uint32_t i = 0; r.ok && i < std::min<uint32_t>(count, MaxTemplates); i++){
++		TaskTemplate t;
++		r.get(t.id); r.get(t.durationMin); r.get(t.icon); r.get(t.color); r.str(t.title);
++		if(r.ok) tpls.push_back(std::move(t));
++	}
++
++	r.get(count);
++	for(uint32_t i = 0; r.ok && i < std::min<uint32_t>(count, MaxPending); i++){
++		PendingAction p;
++		uint8_t type = 0;
++		r.get(type); r.get(p.seq); r.get(p.eventId); r.get(p.tplId); r.get(p.time); r.get(p.status);
++		p.type = type == 2 ? PendingAction::Type::Status : type == 1 ? PendingAction::Type::End : PendingAction::Type::Start;
++		if(r.ok) pend.push_back(p);
++	}
++
++	fclose(f);
++	ESP_LOGI(TAG, "Loaded %u events, %u templates, %u pending", (unsigned) events.size(), (unsigned) tpls.size(), (unsigned) pend.size());
++}
++
++void CalendarStore::save(){
++	FILE* f = fopen(TmpPath, "wb");
++	if(f == nullptr){
++		ESP_LOGE(TAG, "Can't open %s for writing", TmpPath);
++		return;
++	}
++	Writer w{ f };
++
++	w.put(Magic);
++	w.put(nextSeq);
++	w.put(nextLocalId);
++
++	w.put((uint32_t) events.size());
++	for(const auto& e : events){
++		w.put(e.id); w.put(e.start); w.put(e.end); w.put((uint8_t) (e.allDay ? 1 : 0)); w.put(e.remindMin);
++		w.put(e.icon); w.put(e.color); w.put((uint8_t) (e.cancelled ? 1 : 0));
++		w.str(e.title); w.str(e.location);
++	}
++
++	w.put((uint32_t) tpls.size());
++	for(const auto& t : tpls){
++		w.put(t.id); w.put(t.durationMin); w.put(t.icon); w.put(t.color); w.str(t.title);
++	}
++
++	w.put((uint32_t) pend.size());
++	for(const auto& p : pend){
++		w.put((uint8_t) (p.type == PendingAction::Type::Status ? 2 : p.type == PendingAction::Type::End ? 1 : 0));
++		w.put(p.seq); w.put(p.eventId); w.put(p.tplId); w.put(p.time); w.put(p.status);
++	}
++
++	fclose(f);
++	::remove(Path);
++	if(rename(TmpPath, Path) != 0){
++		ESP_LOGE(TAG, "Rename %s -> %s failed", TmpPath, Path);
++	}
++}
+diff --git a/main/src/Calendar/CalendarStore.h b/main/src/Calendar/CalendarStore.h
+new file mode 100644
+index 0000000..667a226
+--- /dev/null
++++ b/main/src/Calendar/CalendarStore.h
+@@ -0,0 +1,118 @@
++#ifndef ARTEMIS_FIRMWARE_CALENDARSTORE_H
++#define ARTEMIS_FIRMWARE_CALENDARSTORE_H
++
++#include <atomic>
++#include <cstdint>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <vector>
++
++// Times use the Time service's "local epoch": unix seconds + the phone's UTC offset,
++// so they compare directly with Time::getTime() and format with gmtime_r().
++struct CalEvent {
++	uint32_t id = 0;          // phone ids are < 2^31; tasks started on the watch have LocalIdBit set
++	int64_t start = 0;
++	int64_t end = 0;
++	bool allDay = false;
++	int16_t remindMin = -1;   // -1 = no reminder
++	uint8_t icon = 0;         // TaskIcons id, 0 = none
++	uint32_t color = 0;       // 0xRRGGBB, 0 = default
++	bool cancelled = false;
++	std::string title;        // ASCII (phone transliterates; stock fonts cover 32..126 only)
++	std::string location;
++};
++
++struct TaskTemplate {
++	uint32_t id = 0;
++	uint16_t durationMin = 30;
++	uint8_t icon = 0;
++	uint32_t color = 0;
++	std::string title;
++};
++
++// Watch -> phone actions, kept (and persisted) until the phone acknowledges them,
++// so tasks started while the phone is away reach the phone on the next connection.
++struct PendingAction {
++	enum class Type : uint8_t { Start, End, Status } type = Type::Start;
++	uint32_t seq = 0;
++	uint32_t eventId = 0;     // Start: local id of the new event; End: id of the finished event
++	uint32_t tplId = 0;       // Start only
++	int64_t time = 0;         // Start: start time; End: end time
++	uint8_t status = 0;       // Status only: 0 = done, 1 = cancelled
++};
++
++class CalendarStore {
++public:
++	static constexpr uint32_t LocalIdBit = 0x80000000;
++	static constexpr size_t MaxEvents = 48;
++	static constexpr size_t MaxTemplates = 16;
++	static constexpr size_t MaxPending = 16;
++	static constexpr size_t MaxTitle = 40;
++	static constexpr size_t MaxLocation = 32;
++
++	static CalendarStore& get();
++
++	// ---- pushed by the phone ----
++	// Full agenda sync: calBegin -> calAdd x N -> calEnd. Live data is swapped only on commit.
++	void beginSync();
++	void stage(const CalEvent& ev);
++	void commitSync();
++	void remove(uint32_t id);
++
++	void beginTemplates();
++	void stageTemplate(const TaskTemplate& tpl);
++	void commitTemplates();
++
++	void ack(uint32_t seq);
++
++	// ---- queries ----
++	std::vector<CalEvent> upcoming(int64_t nowLocal, size_t max) const;
++	std::optional<CalEvent> current(int64_t nowLocal) const;   // latest-started timed event in progress
++	std::vector<TaskTemplate> templates() const;
++	std::vector<PendingAction> pending() const;
++	uint32_t revision() const { return rev.load(); }
++
++	// ---- actions on the watch ----
++	bool startTask(uint32_t tplId, int64_t nowLocal);
++	bool finishCurrent(int64_t nowLocal);
++	bool setStatus(uint32_t eventId, bool cancelled);
++
++	// Reminder alerts waiting to be shown full-screen (TaskAlertScreen).
++	void pushAlert(const CalEvent& e, int64_t nowLocal);
++	std::optional<CalEvent> takeAlert(int64_t nowLocal);   // drops alerts older than 10 min
++
++	// Events whose reminder time passed since the previous call (called ~every 15 s).
++	std::vector<CalEvent> dueReminders(int64_t nowLocal);
++
++	// All-day events remind at 09:00 of their day; timed ones remindMin before start.
++	static int64_t reminderAt(const CalEvent& e);
++
++private:
++	CalendarStore();
++
++	void load();
++	void save();                            // caller holds mtx
++	const CalEvent* currentLocked(int64_t nowLocal) const;
++	bool hasPendingStart(uint32_t eventId) const;
++
++	mutable std::mutex mtx;
++	std::vector<CalEvent> events;
++	std::vector<CalEvent> staging;
++	bool syncing = false;
++	std::vector<TaskTemplate> tpls;
++	std::vector<TaskTemplate> tplStaging;
++	bool tplSyncing = false;
++	std::vector<PendingAction> pend;
++	uint32_t nextSeq = 1;
++	uint32_t nextLocalId = 1;
++	int64_t lastReminderCheck = 0;
++	std::atomic<uint32_t> rev{ 1 };
++	std::vector<std::pair<CalEvent, int64_t>> alerts;
++
++	static constexpr const char* Path = "/spiffs/calendar.bin";
++	static constexpr const char* TmpPath = "/spiffs/calendar.tmp";
++	static constexpr uint32_t Magic = 0x334C4143; // "CAL3"
++};
++
++#endif //ARTEMIS_FIRMWARE_CALENDARSTORE_H
+diff --git a/main/src/Calendar/CalendarUi.h b/main/src/Calendar/CalendarUi.h
+new file mode 100644
+index 0000000..d2296b7
+--- /dev/null
++++ b/main/src/Calendar/CalendarUi.h
+@@ -0,0 +1,31 @@
++#ifndef ARTEMIS_FIRMWARE_CALENDARUI_H
++#define ARTEMIS_FIRMWARE_CALENDARUI_H
++
++#include "Services/Time.h"
++#include "Util/Services.h"
++#include <lvgl.h>
++#include <cstdint>
++#include <ctime>
++
++// The Time service keeps "local epoch" and the device TZ is UTC,
++// so mktime() is the exact inverse of the gmtime_r() it uses.
++inline int64_t calNowLocal(){
++	auto ts = (Time*) Services.get(Service::Time);
++	if(ts == nullptr) return 0;
++	tm t = ts->getTime();
++	return (int64_t) mktime(&t);
++}
++
++inline lv_color_t taskBg(uint32_t rgb){
++	if(rgb == 0) return lv_color_make(0x18, 0x18, 0x20);
++	return lv_color_make((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
++}
++
++// Black text on light task colors, white on dark ones
++inline lv_color_t taskFg(uint32_t rgb){
++	if(rgb == 0) return lv_color_white();
++	const uint32_t r = (rgb >> 16) & 0xff, g = (rgb >> 8) & 0xff, b = rgb & 0xff;
++	return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? lv_color_black() : lv_color_white();
++}
++
++#endif //ARTEMIS_FIRMWARE_CALENDARUI_H
+diff --git a/main/src/Calendar/NightMode.h b/main/src/Calendar/NightMode.h
+new file mode 100644
+index 0000000..1cb1791
+--- /dev/null
++++ b/main/src/Calendar/NightMode.h
+@@ -0,0 +1,23 @@
++#ifndef ARTEMIS_FIRMWARE_NIGHTMODE_H
++#define ARTEMIS_FIRMWARE_NIGHTMODE_H
++
++#include "Services/Time.h"
++#include "Util/Services.h"
++#include <ctime>
++
++// Night mode: LEDs off and minimum screen brightness between StartHour and EndHour (local time).
++// The saved settings are not touched, so everything returns to normal in the morning.
++namespace NightMode {
++constexpr int StartHour = 22;
++constexpr int EndHour = 6;
++
++inline bool active(){
++	auto ts = (Time*) Services.get(Service::Time);
++	if(ts == nullptr) return false;
++	const tm t = ts->getTime();
++	if(t.tm_year + 1900 < 2024) return false;   // clock not set by a phone yet
++	return t.tm_hour >= StartHour || t.tm_hour < EndHour;
++}
++}
++
++#endif //ARTEMIS_FIRMWARE_NIGHTMODE_H
+diff --git a/main/src/Calendar/TaskIcons.c b/main/src/Calendar/TaskIcons.c
+new file mode 100644
+index 0000000..f97cc47
+--- /dev/null
++++ b/main/src/Calendar/TaskIcons.c
+@@ -0,0 +1,57 @@
++#include "TaskIcons.h"
++
++static const uint8_t sleep_map[] = { 0x00, 0x3f, 0x00, 0x02, 0x00, 0x04, 0x00, 0x08, 0x00, 0x10, 0x00, 0x3f, 0x00, 0x00, 0x07, 0xc0, 0x00, 0x80, 0x01, 0x00, 0x02, 0x00, 0x07, 0xc0, 0x00, 0x00, 0xf8, 0x00, 0x10, 0x00, 0x20, 0x00 };
++static const lv_img_dsc_t sleep_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = sleep_map };
++static const uint8_t work_map[] = { 0x00, 0x00, 0x3f, 0xfc, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x20, 0x04, 0x3f, 0xfc, 0x00, 0x00, 0xff, 0xff, 0x80, 0x01, 0x7f, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t work_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = work_map };
++static const uint8_t gym_map[] = { 0x00, 0x00, 0x00, 0x00, 0x60, 0x06, 0x60, 0x06, 0xe8, 0x17, 0xe8, 0x17, 0xef, 0xf7, 0xef, 0xf7, 0xe8, 0x17, 0xe8, 0x17, 0x60, 0x06, 0x60, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t gym_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = gym_map };
++static const uint8_t food_map[] = { 0x00, 0x00, 0x54, 0x1c, 0x54, 0x3c, 0x54, 0x3c, 0x54, 0x3c, 0x7c, 0x3c, 0x38, 0x3c, 0x10, 0x3c, 0x10, 0x14, 0x10, 0x14, 0x10, 0x14, 0x10, 0x14, 0x10, 0x14, 0x10, 0x14, 0x38, 0x36, 0x00, 0x00 };
++static const lv_img_dsc_t food_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = food_map };
++static const uint8_t coffee_map[] = { 0x09, 0x20, 0x12, 0x40, 0x09, 0x20, 0x12, 0x40, 0x00, 0x00, 0x7f, 0xf0, 0x40, 0x1e, 0x40, 0x12, 0x40, 0x12, 0x40, 0x1e, 0x40, 0x10, 0x20, 0x20, 0x1f, 0xc0, 0x00, 0x00, 0xff, 0xf8, 0x00, 0x00 };
++static const lv_img_dsc_t coffee_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = coffee_map };
++static const uint8_t study_map[] = { 0x00, 0x00, 0x00, 0x00, 0x7e, 0x7e, 0x41, 0x82, 0x5d, 0xba, 0x41, 0x82, 0x5d, 0xba, 0x41, 0x82, 0x5d, 0xba, 0x41, 0x82, 0x41, 0x82, 0x7e, 0x7e, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t study_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = study_map };
++static const uint8_t walk_map[] = { 0x01, 0x80, 0x01, 0x80, 0x00, 0x00, 0x03, 0x80, 0x07, 0xc0, 0x0b, 0xa0, 0x13, 0x90, 0x03, 0x80, 0x02, 0x80, 0x04, 0x40, 0x04, 0x40, 0x08, 0x20, 0x10, 0x10, 0x30, 0x18, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t walk_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = walk_map };
++static const uint8_t home_map[] = { 0x01, 0x80, 0x03, 0xc0, 0x06, 0x60, 0x0c, 0x30, 0x18, 0x18, 0x30, 0x0c, 0x60, 0x06, 0x20, 0x04, 0x27, 0x84, 0x24, 0x84, 0x24, 0xb4, 0x24, 0xb4, 0x24, 0x84, 0x3f, 0xfc, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t home_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = home_map };
++static const uint8_t code_map[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x20, 0x10, 0x48, 0x20, 0x84, 0x40, 0x82, 0x81, 0x01, 0x41, 0x02, 0x22, 0x04, 0x12, 0x08, 0x0a, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t code_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = code_map };
++static const uint8_t shop_map[] = { 0x00, 0x00, 0xc0, 0x00, 0x40, 0x00, 0x7f, 0xfc, 0x40, 0x04, 0x20, 0x08, 0x20, 0x08, 0x10, 0x10, 0x1f, 0xf0, 0x10, 0x00, 0x0f, 0xf0, 0x00, 0x00, 0x0c, 0x30, 0x0c, 0x30, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t shop_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = shop_map };
++static const uint8_t car_map[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xe0, 0x08, 0x10, 0x10, 0x08, 0x7f, 0xfe, 0x80, 0x01, 0xb0, 0x0d, 0xb0, 0x0d, 0x80, 0x01, 0x7f, 0xfe, 0x38, 0x1c, 0x38, 0x1c, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t car_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = car_map };
++static const uint8_t kid_map[] = { 0x00, 0x00, 0x07, 0xe0, 0x08, 0x10, 0x10, 0x08, 0x16, 0x68, 0x10, 0x08, 0x13, 0xc8, 0x08, 0x10, 0x07, 0xe0, 0x02, 0x40, 0x0f, 0xf0, 0x14, 0x28, 0x04, 0x20, 0x07, 0xe0, 0x04, 0x20, 0x00, 0x00 };
++static const lv_img_dsc_t kid_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = kid_map };
++static const uint8_t health_map[] = { 0x00, 0x00, 0x00, 0x00, 0x38, 0x38, 0x7c, 0x7c, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0xfe, 0x3f, 0xfc, 0x1f, 0xf8, 0x0f, 0xf0, 0x07, 0xe0, 0x03, 0xc0, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t health_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = health_map };
++static const uint8_t star_map[] = { 0x01, 0x80, 0x01, 0x80, 0x03, 0xc0, 0x03, 0xc0, 0xff, 0xff, 0x7f, 0xfe, 0x3f, 0xfc, 0x1f, 0xf8, 0x1f, 0xf8, 0x3e, 0x7c, 0x3c, 0x3c, 0x70, 0x0e, 0x60, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t star_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = star_map };
++
++static const uint8_t tooth_map[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0xa0, 0x2a, 0xa0, 0x2a, 0xa0, 0x7f, 0xfc, 0x7f, 0xff, 0x07, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t tooth_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = tooth_map };
++static const uint8_t shower_map[] = { 0x01, 0x80, 0x01, 0x80, 0x03, 0xc0, 0x0f, 0xf0, 0x1f, 0xf8, 0x3f, 0xfc, 0x00, 0x00, 0x12, 0x48, 0x00, 0x00, 0x24, 0x92, 0x00, 0x00, 0x12, 0x48, 0x00, 0x00, 0x24, 0x92, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t shower_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = shower_map };
++static const uint8_t dog_map[] = { 0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x78, 0x00, 0xdc, 0x04, 0xf8, 0x04, 0x1f, 0xfc, 0x1f, 0xfc, 0x1f, 0xfc, 0x18, 0x0c, 0x18, 0x0c, 0x18, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t dog_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = dog_map };
++
++static const lv_img_dsc_t* const icons[] = { NULL, &sleep_dsc, &work_dsc, &gym_dsc, &food_dsc, &coffee_dsc, &study_dsc, &walk_dsc, &home_dsc, &code_dsc, &shop_dsc, &car_dsc, &kid_dsc, &health_dsc, &star_dsc, &tooth_dsc, &shower_dsc, &dog_dsc };
++
++const lv_img_dsc_t* task_icon(uint8_t id){
++	return id <= TASK_ICON_COUNT ? icons[id] : NULL;
++}
++
++// UI glyphs for the reminder screen (the firmware's LVGL build has no line widget)
++static const uint8_t check_map[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x07, 0x00, 0x0e, 0x00, 0x1c, 0x30, 0x38, 0x38, 0x70, 0x1c, 0xe0, 0x0f, 0xc0, 0x07, 0x80, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
++static const uint8_t cross_map[] = { 0x00, 0x00, 0x00, 0x00, 0x30, 0x0c, 0x38, 0x1c, 0x1c, 0x38, 0x0e, 0x70, 0x07, 0xe0, 0x03, 0xc0, 0x03, 0xc0, 0x07, 0xe0, 0x0e, 0x70, 0x1c, 0x38, 0x38, 0x1c, 0x30, 0x0c, 0x00, 0x00, 0x00, 0x00 };
++static const lv_img_dsc_t check_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = check_map };
++static const lv_img_dsc_t cross_dsc = { .header = { .cf = LV_IMG_CF_ALPHA_1BIT, .always_zero = 0, .reserved = 0, .w = 16, .h = 16 }, .data_size = 32, .data = cross_map };
++
++const lv_img_dsc_t* task_icon_check(void){
++	return &check_dsc;
++}
++
++const lv_img_dsc_t* task_icon_cross(void){
++	return &cross_dsc;
++}
+diff --git a/main/src/Calendar/TaskIcons.h b/main/src/Calendar/TaskIcons.h
+new file mode 100644
+index 0000000..a5a1422
+--- /dev/null
++++ b/main/src/Calendar/TaskIcons.h
+@@ -0,0 +1,22 @@
++#ifndef ARTEMIS_FIRMWARE_TASKICONS_H
++#define ARTEMIS_FIRMWARE_TASKICONS_H
++
++#include <lvgl.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// 16x16 1-bit alpha icons, recolored at draw time (style img_recolor) to the task's text color.
++// Generated from the same pixel art as the phone's TaskIcons.kt; id 0 = no icon.
++#define TASK_ICON_COUNT 17
++const lv_img_dsc_t* task_icon(uint8_t id);
++const lv_img_dsc_t* task_icon_check(void);
++const lv_img_dsc_t* task_icon_cross(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif //ARTEMIS_FIRMWARE_TASKICONS_H
+diff --git a/main/src/Notifs/Android.cpp b/main/src/Notifs/Android.cpp
+index 628aad4..c75b7d6 100644
+--- a/main/src/Notifs/Android.cpp
++++ b/main/src/Notifs/Android.cpp
+@@ -1,6 +1,7 @@
+ #include "Android.h"
+ #include "Util/Services.h"
+ #include "Services/Time.h"
++#include "Calendar/CalendarStore.h"
+ #include <esp_log.h>
+ #include <cctype>
+ #include <optional>
+@@ -220,6 +221,50 @@ void Android::handleCommand(const std::string& line){
+ 
+ 		handleMediaInfo(split_line);
+ 		return;
++	}else if(command == "calBegin"){
++		CalendarStore::get().beginSync();
++		return;
++	}else if(command == "calAdd"){
++		if(split_line.size() < 7){
++			ESP_LOGW(TAG, "Invalid calAdd command: %s", line.c_str());
++			return;
++		}
++
++		handleCalAdd(split_line);
++		return;
++	}else if(command == "calEnd"){
++		CalendarStore::get().commitSync();
++		return;
++	}else if(command == "tplBegin"){
++		CalendarStore::get().beginTemplates();
++		return;
++	}else if(command == "tplAdd"){
++		if(split_line.size() < 4){
++			ESP_LOGW(TAG, "Invalid tplAdd command: %s", line.c_str());
++			return;
++		}
++
++		handleTplAdd(split_line);
++		return;
++	}else if(command == "tplEnd"){
++		CalendarStore::get().commitTemplates();
++		return;
++	}else if(command == "taskAck"){
++		if(split_line.size() < 2){
++			ESP_LOGW(TAG, "Invalid taskAck command: %s", line.c_str());
++			return;
++		}
++
++		CalendarStore::get().ack((uint32_t) std::stoul(split_line[1]));
++		return;
++	}else if(command == "calDel"){
++		if(split_line.size() < 2){
++			ESP_LOGW(TAG, "Invalid calDel command: %s", line.c_str());
++			return;
++		}
++
++		CalendarStore::get().remove((uint32_t) std::stoul(split_line[1]));
++		return;
+ 	}else{
+ 		ESP_LOGW(TAG, "Unknown command: %s", line.c_str());
+ 		return;
+@@ -235,6 +280,7 @@ void Android::handleHello(const std::vector<std::string>& split_line){
+ 	}else{
+ 		ESP_LOGI(TAG, "Connected! Hello received, protocol version: %s", protocolVersion.c_str());
+ 		onConnect();
++		flushPending();
+ 	}
+ }
+ 
+@@ -366,6 +412,57 @@ void Android::handleMediaInfo(const std::vector<std::string>& split_line){
+ 	mediaInfo(media);
+ }
+ 
++// calAdd;<id>;<startLocal>;<endLocal>;<allDay>;<title>;<location>[;<remindMin>[;<icon>;<rgb>;<cancelled>]]
++void Android::handleCalAdd(const std::vector<std::string>& split_line){
++	CalEvent ev;
++	ev.id = (uint32_t) std::stoul(split_line[1]);
++	ev.start = std::stoll(split_line[2]);
++	ev.end = std::stoll(split_line[3]);
++	ev.allDay = split_line[4] == "1";
++	ev.title = split_line[5];
++	ev.location = split_line[6];
++	ev.remindMin = split_line.size() >= 8 ? (int16_t) std::stoi(split_line[7]) : -1;
++	if(split_line.size() >= 11){
++		ev.icon = (uint8_t) std::stoul(split_line[8]);
++		ev.color = (uint32_t) std::stoul(split_line[9]);
++		ev.cancelled = split_line[10] == "1";
++	}
++	CalendarStore::get().stage(ev);
++}
++
++// tplAdd;<id>;<durationMin>;<title>
++void Android::handleTplAdd(const std::vector<std::string>& split_line){
++	TaskTemplate t;
++	t.id = (uint32_t) std::stoul(split_line[1]);
++	t.durationMin = (uint16_t) std::stoul(split_line[2]);
++	t.title = split_line[3];
++	if(split_line.size() >= 6){
++		t.icon = (uint8_t) std::stoul(split_line[4]);
++		t.color = (uint32_t) std::stoul(split_line[5]);
++	}
++	CalendarStore::get().stageTemplate(t);
++}
++
++// taskStart;<seq>;<localId>;<tplId>;<startLocal>   taskEnd;<seq>;<eventId>;<endLocal>   taskStatus;<seq>;<eventId>;<0|1>
++void Android::flushPending(){
++	if(!connected) return;
++	for(const auto& p : CalendarStore::get().pending()){
++		if(p.type == PendingAction::Type::Start){
++			uart.printf("taskStart;%lu;%lu;%lu;%lld\n", (unsigned long) p.seq, (unsigned long) p.eventId, (unsigned long) p.tplId, (long long) p.time);
++		}else if(p.type == PendingAction::Type::End){
++			uart.printf("taskEnd;%lu;%lu;%lld\n", (unsigned long) p.seq, (unsigned long) p.eventId, (long long) p.time);
++		}else{
++			uart.printf("taskStatus;%lu;%lu;%u\n", (unsigned long) p.seq, (unsigned long) p.eventId, (unsigned) p.status);
++		}
++	}
++}
++
++// calSync
++void Android::calSync(){
++	if(!connected) return;
++	uart.printf("calSync\n");
++}
++
+ // mediaPlay
+ void Android::mediaPlay(){
+ 	if(!connected) return;
+diff --git a/main/src/Notifs/Android.h b/main/src/Notifs/Android.h
+index 007a7e9..224cc33 100644
+--- a/main/src/Notifs/Android.h
++++ b/main/src/Notifs/Android.h
+@@ -17,7 +17,7 @@
+ class Android : public NotifSource, public MediaSource, private Threaded {
+ public:
+ 	static constexpr const char* ProtocolVersion = "1";
+-	static constexpr const char* FirmwareVersion = "v2.1";
++	static constexpr const char* FirmwareVersion = "v2.1-cal3"; // "-calN": calendar protocol level for the companion app
+ 
+ 	Android(BLE::Server* server);
+ 	virtual ~Android();
+@@ -34,6 +34,11 @@ public:
+ 	void findPhoneStop();
+ 	bool findPhoneActive();
+ 
++	// Ask the phone to push the full agenda again (calBegin/calAdd/calEnd)
++	void calSync();
++	// Send task start/finish actions the phone hasn't acknowledged yet
++	void flushPending();
++
+ private:
+ 	void loop() override;
+ 
+@@ -62,6 +67,8 @@ private:
+ 	void handleFindPhoneStopNack();
+ 	void handleMediaState(const std::vector<std::string>& split_line);
+ 	void handleMediaInfo(const std::vector<std::string>& split_line);
++	void handleCalAdd(const std::vector<std::string>& split_line);
++	void handleTplAdd(const std::vector<std::string>& split_line);
+ 
+ 	static std::vector<std::string> splitProtocolMsg(const std::string& s, char delim = ';');
+ 
+diff --git a/main/src/Notifs/Phone.cpp b/main/src/Notifs/Phone.cpp
+index 2de6c84..10faf5e 100644
+--- a/main/src/Notifs/Phone.cpp
++++ b/main/src/Notifs/Phone.cpp
+@@ -88,11 +88,19 @@ MediaState Phone::getMediaState(){
+ }
+ 
+ void Phone::doPos(uint32_t id){
++	if(id & LocalNotifBit){
++		onRemove(id);
++		return;
++	}
+ 	if(current == nullptr || findNotif(id) == notifs.end()) return;
+ 	current->actionPos(id);
+ }
+ 
+ void Phone::doNeg(uint32_t id){
++	if(id & LocalNotifBit){
++		onRemove(id);
++		return;
++	}
+ 	if(current == nullptr || findNotif(id) == notifs.end()) return;
+ 	current->actionNeg(id);
+ }
+@@ -216,3 +224,18 @@ bool Phone::findPhoneActive(){
+ 	if(current != &android) return false;
+ 	return android.findPhoneActive();
+ }
++
++void Phone::calendarSync(){
++	if(current != &android) return;
++	android.calSync();
++}
++
++void Phone::calendarFlush(){
++	if(current != &android) return;
++	android.flushPending();
++}
++
++void Phone::addLocal(Notif notif){
++	notif.uid |= LocalNotifBit;
++	onAdd(std::move(notif));
++}
+diff --git a/main/src/Notifs/Phone.h b/main/src/Notifs/Phone.h
+index 1206306..fce1693 100644
+--- a/main/src/Notifs/Phone.h
++++ b/main/src/Notifs/Phone.h
+@@ -59,6 +59,16 @@ public:
+ 	void findPhoneStop();
+ 	bool findPhoneActive();
+ 
++	// Android only: request a calendar push from the companion app
++	void calendarSync();
++	// Android only: send queued task start/finish actions to the companion app
++	void calendarFlush();
++
++	// Notification raised on the watch itself (calendar reminders). Dismissed locally,
++	// works without a phone. Phone-side ids are always below this bit.
++	static constexpr uint32_t LocalNotifBit = 0x80000000;
++	void addLocal(Notif notif);
++
+ private:
+ 	ANCS::Client ancs;
+ 	AMS::Client ams;
+diff --git a/main/src/Screens/Agenda/AgendaScreen.cpp b/main/src/Screens/Agenda/AgendaScreen.cpp
+new file mode 100644
+index 0000000..7322e1e
+--- /dev/null
++++ b/main/src/Screens/Agenda/AgendaScreen.cpp
+@@ -0,0 +1,271 @@
++#include "AgendaScreen.h"
++#include "Calendar/CalendarStore.h"
++#include "Screens/MainMenu/MainMenu.h"
++#include "Devices/Input.h"
++#include "Services/Time.h"
++#include "Notifs/Phone.h"
++#include "Util/Services.h"
++#include "Theme/theme.h"
++#include "Calendar/CalendarUi.h"
++#include <cstdio>
++#include <ctime>
++
++static const lv_color_t ColText = lv_color_white();
++static const lv_color_t ColDay = lv_color_make(0xff, 0x8a, 0x00);
++static const lv_color_t ColNow = lv_color_make(0x4c, 0xd9, 0x64);
++static const lv_color_t ColDim = lv_color_make(0x90, 0x90, 0x90);
++
++static int64_t nowLocal(){
++	return calNowLocal();
++}
++
++static Phone* phone(){
++	return (Phone*) Services.get(Service::Phone);
++}
++
++AgendaScreen::AgendaScreen() : queue(4){
++	lv_obj_set_size(*this, 128, 128);
++	lv_obj_set_style_bg_color(*this, lv_color_black(), 0);
++	lv_obj_set_style_bg_opa(*this, LV_OPA_COVER, 0);
++
++	header = lv_label_create(*this);
++	lv_obj_set_style_text_font(header, &devin, 0);
++	lv_obj_set_style_text_color(header, ColDay, 0);
++	lv_obj_set_pos(header, 4, 2);
++
++	list = lv_obj_create(*this);
++	lv_obj_set_pos(list, 0, 16);
++	lv_obj_set_size(list, 128, 112);
++	lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
++	lv_obj_set_style_border_width(list, 0, 0);
++	lv_obj_set_style_radius(list, 0, 0);
++	lv_obj_set_style_pad_all(list, 3, 0);
++	lv_obj_set_style_pad_row(list, 2, 0);
++	lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
++	lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
++}
++
++AgendaScreen::~AgendaScreen() = default;
++
++void AgendaScreen::onStart(){
++	Events::listen(Facility::Input, &queue);
++}
++
++void AgendaScreen::onStop(){
++	Events::unlisten(&queue);
++}
++
++lv_obj_t* AgendaScreen::addLabel(const char* text, lv_color_t color){
++	auto label = lv_label_create(list);
++	lv_obj_set_width(label, 120);
++	lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
++	lv_obj_set_style_text_font(label, &devin, 0);
++	lv_obj_set_style_text_color(label, color, 0);
++	lv_label_set_text(label, text);
++	return label;
++}
++
++// ---- agenda ----------------------------------------------------------------------------------
++
++void AgendaScreen::showAgenda(int64_t now){
++	mode = Mode::Agenda;
++	auto& store = CalendarStore::get();
++	shownRev = store.revision();
++	shownMinute = now / 60;
++
++	lv_label_set_text(header, "AGENDA");
++	lv_obj_clean(list);
++	rows.clear();
++	lv_obj_scroll_to_y(list, 0, LV_ANIM_OFF);
++
++	const auto events = store.upcoming(now, MaxShown);
++	if(events.empty()){
++		addLabel("No upcoming events.\n\nClick the wheel for\nactions and sync.", ColDim);
++		return;
++	}
++
++	char buf[96];
++	char t0[8], t1[8];
++	int lastYday = -1, lastYear = -1;
++
++	for(const auto& e : events){
++		const time_t start = (time_t) e.start, end = (time_t) e.end;
++		tm ts = {}, te = {};
++		gmtime_r(&start, &ts);
++		gmtime_r(&end, &te);
++
++		if(ts.tm_yday != lastYday || ts.tm_year != lastYear){
++			const bool first = lastYday == -1;
++			lastYday = ts.tm_yday;
++			lastYear = ts.tm_year;
++			strftime(buf, sizeof(buf), "%a %d %b", &ts);
++			auto header = addLabel(buf, ColDay);
++			if(!first) lv_obj_set_style_pad_top(header, 9, 0);   // an empty line between days
++		}
++
++		const char* mark = e.cancelled ? "x " : "";
++		if(e.allDay){
++			snprintf(buf, sizeof(buf), "%sall day %s", mark, e.title.c_str());
++		}else{
++			strftime(t0, sizeof(t0), "%H:%M", &ts);
++			strftime(t1, sizeof(t1), "%H:%M", &te);
++			snprintf(buf, sizeof(buf), "%s%s-%s %s", mark, t0, t1, e.title.c_str());
++		}
++		addLabel(buf, e.cancelled ? ColDim : e.start <= now ? ColNow : ColText);
++
++		if(!e.location.empty()){
++			snprintf(buf, sizeof(buf), "  @ %s", e.location.c_str());
++			addLabel(buf, ColDim);
++		}
++	}
++}
++
++// ---- menus -----------------------------------------------------------------------------------
++
++void AgendaScreen::showMenu(const char* title, const std::vector<std::string>& items){
++	lv_label_set_text(header, title);
++	lv_obj_clean(list);
++	rows.clear();
++	selected = 0;
++
++	for(const auto& item : items){
++		auto row = addLabel(item.c_str(), ColText);
++		lv_label_set_long_mode(row, LV_LABEL_LONG_DOT);
++		lv_obj_set_style_pad_hor(row, 2, 0);
++		lv_obj_set_style_pad_ver(row, 1, 0);
++		lv_obj_set_style_bg_color(row, ColDay, 0);
++		rows.push_back(row);
++	}
++	moveSelection(0);
++}
++
++void AgendaScreen::moveSelection(int delta){
++	if(rows.empty()) return;
++	selected = (selected + delta + (int) rows.size()) % (int) rows.size();
++	for(int i = 0; i < (int) rows.size(); i++){
++		const bool sel = i == selected;
++		lv_obj_set_style_bg_opa(rows[i], sel ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
++		lv_obj_set_style_text_color(rows[i], sel ? lv_color_black() : ColText, 0);
++	}
++	lv_obj_scroll_to_view(rows[selected], LV_ANIM_ON);
++}
++
++void AgendaScreen::showActions(){
++	mode = Mode::Actions;
++	actions.clear();
++	std::vector<std::string> items;
++
++	auto& store = CalendarStore::get();
++	if(!store.templates().empty()){
++		actions.push_back(Action::StartTask);
++		items.emplace_back("Start task...");
++	}
++	if(auto cur = store.current(nowLocal())){
++		actions.push_back(Action::Finish);
++		items.emplace_back("Finish: " + cur->title);
++		actions.push_back(Action::Cancel);
++		items.emplace_back("Cancel: " + cur->title);
++	}
++	actions.push_back(Action::Sync);
++	items.emplace_back("Sync with phone");
++
++	showMenu("ACTIONS", items);
++}
++
++void AgendaScreen::showTemplates(){
++	mode = Mode::Templates;
++	templateIds.clear();
++	std::vector<std::string> items;
++
++	for(const auto& t : CalendarStore::get().templates()){
++		templateIds.push_back(t.id);
++		char dur[16];
++		if(t.durationMin % 60 == 0) snprintf(dur, sizeof(dur), " %uh", (unsigned) (t.durationMin / 60));
++		else snprintf(dur, sizeof(dur), " %um", (unsigned) t.durationMin);
++		items.push_back(t.title + dur);
++	}
++	showMenu("START TASK", items);
++}
++
++void AgendaScreen::activate(){
++	if(mode == Mode::Actions){
++		if(selected < 0 || selected >= (int) actions.size()) return;
++		switch(actions[selected]){
++			case Action::StartTask:
++				showTemplates();
++				return;
++			case Action::Finish:
++				if(CalendarStore::get().finishCurrent(nowLocal())){
++					if(auto p = phone()) p->calendarFlush();
++				}
++				break;
++			case Action::Cancel:
++				if(auto cur = CalendarStore::get().current(nowLocal())){
++					if(CalendarStore::get().setStatus(cur->id, true)){
++						if(auto p = phone()) p->calendarFlush();
++					}
++				}
++				break;
++			case Action::Sync:
++				if(auto p = phone()) p->calendarSync();
++				break;
++		}
++		showAgenda(nowLocal());
++	}else if(mode == Mode::Templates){
++		if(selected < 0 || selected >= (int) templateIds.size()) return;
++		if(CalendarStore::get().startTask(templateIds[selected], nowLocal())){
++			if(auto p = phone()) p->calendarFlush();
++		}
++		showAgenda(nowLocal());
++	}
++}
++
++// ---- input -----------------------------------------------------------------------------------
++
++void AgendaScreen::onButton(uint8_t btn){
++	switch(btn){
++		case Input::Up:
++			if(mode == Mode::Agenda) lv_obj_scroll_by(list, 0, ScrollStep, LV_ANIM_ON);
++			else moveSelection(-1);
++			break;
++		case Input::Down:
++			if(mode == Mode::Agenda) lv_obj_scroll_by(list, 0, -ScrollStep, LV_ANIM_ON);
++			else moveSelection(1);
++			break;
++		case Input::Select:
++			if(mode == Mode::Agenda) showActions();
++			else activate();
++			break;
++		case Input::Alt:
++			if(mode == Mode::Templates) showActions();
++			else if(mode == Mode::Actions) showAgenda(nowLocal());
++			else transition([](){ return std::make_unique<MainMenu>(); });
++			break;
++		default:
++			break;
++	}
++}
++
++void AgendaScreen::loop(){
++	if(mode == Mode::Agenda){
++		// Rebuild when the phone pushed new data, and once a minute so finished events drop off
++		const int64_t now = nowLocal();
++		if(CalendarStore::get().revision() != shownRev || now / 60 != shownMinute){
++			showAgenda(now);
++		}
++	}
++
++	Event evt{};
++	if(!queue.get(evt, 0)) return;
++
++	if(evt.facility == Facility::Input){
++		auto data = (Input::Data*) evt.data;
++		const bool press = data->action == Input::Data::Press;
++		const uint8_t btn = (uint8_t) data->btn;
++		free(evt.data);
++		if(press) onButton(btn);   // may transition away, so evt.data is freed first
++		return;
++	}
++
++	free(evt.data);
++}
+diff --git a/main/src/Screens/Agenda/AgendaScreen.h b/main/src/Screens/Agenda/AgendaScreen.h
+new file mode 100644
+index 0000000..f0c0e12
+--- /dev/null
++++ b/main/src/Screens/Agenda/AgendaScreen.h
+@@ -0,0 +1,53 @@
++#ifndef ARTEMIS_FIRMWARE_AGENDASCREEN_H
++#define ARTEMIS_FIRMWARE_AGENDASCREEN_H
++
++#include "LV_Interface/LVScreen.h"
++#include "Util/Events.h"
++#include <cstdint>
++#include <string>
++#include <vector>
++
++// Agenda:     wheel = scroll, click = actions, power button = back to menu
++// Actions:    "Start task..." / "Finish: <current>" / "Sync with phone"
++// Templates:  task presets defined on the phone; click starts one now
++class AgendaScreen : public LVScreen {
++public:
++	AgendaScreen();
++	~AgendaScreen() override;
++
++private:
++	enum class Mode { Agenda, Actions, Templates };
++	enum class Action { StartTask, Finish, Cancel, Sync };
++
++	void onStart() override;
++	void onStop() override;
++	void loop() override;
++
++	void showAgenda(int64_t now);
++	void showActions();
++	void showTemplates();
++	void showMenu(const char* title, const std::vector<std::string>& items);
++	void moveSelection(int delta);
++	void activate();
++	void onButton(uint8_t btn);
++
++	lv_obj_t* addLabel(const char* text, lv_color_t color);
++
++	EventQueue queue;
++	lv_obj_t* header;
++	lv_obj_t* list;
++
++	Mode mode = Mode::Agenda;
++	std::vector<lv_obj_t*> rows;
++	std::vector<Action> actions;
++	std::vector<uint32_t> templateIds;
++	int selected = 0;
++
++	uint32_t shownRev = 0;
++	int64_t shownMinute = -1;
++
++	static constexpr size_t MaxShown = 20;
++	static constexpr int16_t ScrollStep = 24;
++};
++
++#endif //ARTEMIS_FIRMWARE_AGENDASCREEN_H
+diff --git a/main/src/Screens/Agenda/TaskAlertScreen.cpp b/main/src/Screens/Agenda/TaskAlertScreen.cpp
+new file mode 100644
+index 0000000..14ade78
+--- /dev/null
++++ b/main/src/Screens/Agenda/TaskAlertScreen.cpp
+@@ -0,0 +1,137 @@
++#include "TaskAlertScreen.h"
++#include "Calendar/CalendarUi.h"
++#include "Calendar/TaskIcons.h"
++#include "Devices/Input.h"
++#include "Notifs/Phone.h"
++#include "Screens/Lock/LockScreen.h"
++#include "Services/SleepMan.h"
++#include "Theme/theme.h"
++#include <cstdio>
++
++static lv_obj_t* glyph(lv_obj_t* parent, const lv_img_dsc_t* img, lv_color_t c){
++	auto i = lv_img_create(parent);
++	lv_img_set_src(i, img);
++	lv_obj_set_style_img_recolor(i, c, 0);
++	lv_obj_set_style_img_recolor_opa(i, LV_OPA_COVER, 0);
++	lv_obj_center(i);
++	return i;
++}
++
++TaskAlertScreen::TaskAlertScreen(CalEvent e) : event(std::move(e)), queue(4){
++	fg = taskFg(event.color);
++	lv_obj_set_size(*this, 128, 128);
++	lv_obj_set_style_bg_color(*this, taskBg(event.color), 0);
++	lv_obj_set_style_bg_opa(*this, LV_OPA_COVER, 0);
++	lv_obj_clear_flag(*this, LV_OBJ_FLAG_SCROLLABLE);
++
++	if(const auto* img = task_icon(event.icon)){
++		auto icon = lv_img_create(*this);
++		lv_img_set_src(icon, img);
++		lv_img_set_zoom(icon, 512);   // 16 px art shown at 32 px
++		lv_obj_set_style_img_recolor(icon, fg, 0);
++		lv_obj_set_style_img_recolor_opa(icon, LV_OPA_COVER, 0);
++		lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 18);
++	}
++
++	auto title = lv_label_create(*this);
++	lv_obj_set_width(title, 120);
++	lv_obj_set_style_text_font(title, &taskfont20, 0);
++	lv_obj_set_style_text_color(title, fg, 0);
++	lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
++	lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
++	lv_label_set_text(title, event.title.c_str());
++	lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 44);
++
++	clock = lv_label_create(*this);
++	lv_obj_set_style_text_font(clock, &taskfont12, 0);
++	lv_obj_set_style_text_color(clock, fg, 0);
++	lv_obj_align(clock, LV_ALIGN_TOP_MID, 0, 82);
++
++	for(int i = 0; i < 2; i++){
++		boxes[i] = lv_obj_create(*this);
++		lv_obj_set_size(boxes[i], 30, 26);
++		lv_obj_align(boxes[i], LV_ALIGN_BOTTOM_MID, i == 0 ? -26 : 26, -4);
++		lv_obj_set_style_bg_opa(boxes[i], LV_OPA_TRANSP, 0);
++		lv_obj_set_style_border_color(boxes[i], fg, 0);
++		lv_obj_set_style_radius(boxes[i], 4, 0);
++		lv_obj_set_style_pad_all(boxes[i], 0, 0);
++		lv_obj_clear_flag(boxes[i], LV_OBJ_FLAG_SCROLLABLE);
++	}
++	glyph(boxes[0], task_icon_check(), fg);
++	glyph(boxes[1], task_icon_cross(), fg);
++	select(0);
++}
++
++TaskAlertScreen::~TaskAlertScreen() = default;
++
++void TaskAlertScreen::onStart(){
++	Events::listen(Facility::Input, &queue);
++}
++
++void TaskAlertScreen::onStop(){
++	Events::unlisten(&queue);
++}
++
++void TaskAlertScreen::select(int opt){
++	option = opt;
++	for(int i = 0; i < 2; i++){
++		lv_obj_set_style_border_width(boxes[i], i == option ? 2 : 0, 0);
++	}
++}
++
++void TaskAlertScreen::removeNotif(){
++	if(auto phone = (Phone*) Services.get(Service::Phone)){
++		phone->doNeg(Phone::LocalNotifBit | (event.id & ~Phone::LocalNotifBit));
++	}
++}
++
++void TaskAlertScreen::finish(bool cancelled){
++	removeNotif();
++	if(CalendarStore::get().setStatus(event.id, cancelled)){
++		if(auto phone = (Phone*) Services.get(Service::Phone)) phone->calendarFlush();
++	}
++	transition([](){ return std::make_unique<LockScreen>(); });
++}
++
++void TaskAlertScreen::dismiss(){
++	removeNotif();
++	if(auto sleep = (SleepMan*) Services.get(Service::Sleep)) sleep->requestSleep();
++}
++
++void TaskAlertScreen::loop(){
++	const int64_t now = calNowLocal();
++	if(now / 60 != shownMinute){
++		shownMinute = now / 60;
++		const time_t t = (time_t) now;
++		tm tmv = {};
++		gmtime_r(&t, &tmv);
++		char buf[8];
++		strftime(buf, sizeof(buf), "%H:%M", &tmv);
++		lv_label_set_text(clock, buf);
++	}
++
++	Event evt{};
++	if(!queue.get(evt, 0)) return;
++	if(evt.facility != Facility::Input){
++		free(evt.data);
++		return;
++	}
++	auto data = (Input::Data*) evt.data;
++	const bool press = data->action == Input::Data::Press;
++	const auto btn = data->btn;
++	free(evt.data);
++	if(!press) return;
++
++	switch(btn){
++		case Input::Up:
++		case Input::Down:
++			select(1 - option);
++			break;
++		case Input::Select:
++			finish(option == 1);
++			break;
++		case Input::Alt:
++			dismiss();
++			break;
++	}
++}
+diff --git a/main/src/Screens/Agenda/TaskAlertScreen.h b/main/src/Screens/Agenda/TaskAlertScreen.h
+new file mode 100644
+index 0000000..7f7cc6e
+--- /dev/null
++++ b/main/src/Screens/Agenda/TaskAlertScreen.h
+@@ -0,0 +1,35 @@
++#ifndef ARTEMIS_FIRMWARE_TASKALERTSCREEN_H
++#define ARTEMIS_FIRMWARE_TASKALERTSCREEN_H
++
++#include "LV_Interface/LVScreen.h"
++#include "Util/Events.h"
++#include "Calendar/CalendarStore.h"
++
++// Full-screen reminder: icon, task name, current time, and ✓ / ✗ at the bottom.
++// Wheel (Up/Down) picks ✓ or ✗, Select confirms (done / cancelled),
++// the other button (Alt) just dismisses and turns the screen off.
++class TaskAlertScreen : public LVScreen {
++public:
++	explicit TaskAlertScreen(CalEvent event);
++	~TaskAlertScreen() override;
++
++private:
++	void onStart() override;
++	void onStop() override;
++	void loop() override;
++
++	void select(int option);
++	void finish(bool cancelled);
++	void dismiss();
++	void removeNotif();
++
++	CalEvent event;
++	EventQueue queue;
++	lv_obj_t* clock;
++	lv_obj_t* boxes[2];
++	int option = 0;          // 0 = ✓ done, 1 = ✗ cancel
++	int64_t shownMinute = -1;
++	lv_color_t fg;
++};
++
++#endif //ARTEMIS_FIRMWARE_TASKALERTSCREEN_H
+diff --git a/main/src/Screens/Lock/LockScreen.cpp b/main/src/Screens/Lock/LockScreen.cpp
+index 759ba90..1a1fa4f 100644
+--- a/main/src/Screens/Lock/LockScreen.cpp
++++ b/main/src/Screens/Lock/LockScreen.cpp
+@@ -1,4 +1,7 @@
+ #include "LockScreen.h"
++#include "Calendar/CalendarStore.h"
++#include "Calendar/CalendarUi.h"
++#include "Screens/Agenda/TaskAlertScreen.h"
+ #include "Util/Services.h"
+ #include "Theme/theme.h"
+ #include "Services/Time.h"
+@@ -73,6 +76,12 @@ void LockScreen::prepare(){
+ }
+ 
+ void LockScreen::loop(){
++	// A calendar reminder fired: show it full-screen (the screen was just woken for it)
++	if(auto alert = CalendarStore::get().takeAlert(calNowLocal())){
++		transition([e = *alert](){ return std::make_unique<TaskAlertScreen>(e); });
++		return;
++	}
++
+ 	if(skin != nullptr){
+ 		skin->loop();
+ 
+diff --git a/main/src/Screens/Lock/LockSkin.cpp b/main/src/Screens/Lock/LockSkin.cpp
+index 821d925..74ee7ac 100644
+--- a/main/src/Screens/Lock/LockSkin.cpp
++++ b/main/src/Screens/Lock/LockSkin.cpp
+@@ -1,4 +1,5 @@
+ #include "LockSkin.h"
++#include "TaskFace.h"
+ #include "Filepaths.hpp"
+ #include "Settings/Settings.h"
+ #include "Util/Services.h"
+@@ -41,6 +42,10 @@ void LockSkin::loop(){
+ 		clock->loop();
+ 	}
+ 
++	if(face != nullptr){
++		face->loop();
++	}
++
+ 	if(media != nullptr){
+ 		media->loop();
+ 	}
+@@ -325,6 +330,12 @@ void LockSkin::buildUI(){
+ 	lv_obj_set_style_text_color(date, themeData.dateColor, 0);
+ 	setDateLabel();
+ 
++	// Task watch face replaces the themed clock, date and notification icons
++	face = new TaskFace(main);
++	lv_obj_add_flag(*clock, LV_OBJ_FLAG_HIDDEN);
++	lv_obj_add_flag(date, LV_OBJ_FLAG_HIDDEN);
++	lv_obj_add_flag(*icons, LV_OBJ_FLAG_HIDDEN);
++
+ 	locker = new Slider(main, themeData.sliderConfig);
+ 	lv_obj_set_y(*locker, themeData.sliderY);
+ 
+@@ -352,7 +363,7 @@ void LockSkin::buildUI(){
+ 
+ 	lv_obj_set_style_bg_color(main, lv_color_black(), 0);
+ 	lv_obj_set_style_bg_opa(main, LV_OPA_COVER, 0);
+-	lv_obj_set_style_bg_img_src(main, THEMED_FILE(LockScreen, Background, themeData.theme), 0);
++	// no themed background image: TaskFace paints main in the current task's color
+ 
+ 	lv_obj_set_style_bg_color(rest, settings->get().themeData.backgroundColor, 0);
+ 	lv_obj_set_style_bg_opa(rest, LV_OPA_COVER, 0);
+diff --git a/main/src/Screens/Lock/LockSkin.h b/main/src/Screens/Lock/LockSkin.h
+index 4277c2a..c2aa69d 100644
+--- a/main/src/Screens/Lock/LockSkin.h
++++ b/main/src/Screens/Lock/LockSkin.h
+@@ -34,6 +34,7 @@ private:
+ 	BatteryElement* batteryElement;
+ 	lv_obj_t* battery;
+ 	ClockLabelBig* clock = nullptr;
++	class TaskFace* face = nullptr;
+ 	class NotifIconsElement* icons = nullptr;
+ 	Slider* locker = nullptr;
+ 	lv_obj_t* rest = nullptr;
+diff --git a/main/src/Screens/Lock/TaskFace.cpp b/main/src/Screens/Lock/TaskFace.cpp
+new file mode 100644
+index 0000000..9b03455
+--- /dev/null
++++ b/main/src/Screens/Lock/TaskFace.cpp
+@@ -0,0 +1,117 @@
++#include "TaskFace.h"
++#include "Calendar/CalendarStore.h"
++#include "Calendar/CalendarUi.h"
++#include "Calendar/TaskIcons.h"
++#include "Theme/theme.h"
++#include <cctype>
++#include <cstdio>
++
++static lv_obj_t* makeLabel(lv_obj_t* parent, const lv_font_t* font, int y){
++	auto l = lv_label_create(parent);
++	lv_obj_set_style_text_font(l, font, 0);
++	lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
++	lv_obj_set_width(l, 120);
++	lv_obj_align(l, LV_ALIGN_TOP_MID, 0, y);
++	lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
++	lv_label_set_text(l, "");
++	return l;
++}
++
++static lv_obj_t* makeLine(lv_obj_t* parent, int y){
++	auto l = lv_obj_create(parent);
++	lv_obj_set_size(l, 104, 1);
++	lv_obj_align(l, LV_ALIGN_TOP_MID, 0, y);
++	lv_obj_set_style_border_width(l, 0, 0);
++	lv_obj_set_style_radius(l, 0, 0);
++	lv_obj_set_style_bg_opa(l, LV_OPA_COVER, 0);
++	return l;
++}
++
++TaskFace::TaskFace(lv_obj_t* parent) : LVObject(parent), bgTarget(parent){
++	lv_obj_set_size(*this, 128, 128);
++	lv_obj_set_pos(*this, 0, 0);
++	lv_obj_set_style_bg_opa(*this, LV_OPA_TRANSP, 0);
++	lv_obj_set_style_border_width(*this, 0, 0);
++	lv_obj_set_style_pad_all(*this, 0, 0);
++	lv_obj_clear_flag(*this, LV_OBJ_FLAG_SCROLLABLE);
++	lv_obj_move_background(*this);   // battery / phone indicators stay on top
++
++	icon = lv_img_create(*this);
++	lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 13);
++
++	time = makeLabel(*this, &facetime36, 27);
++	date = makeLabel(*this, &taskfont12, 51);
++	line1 = makeLine(*this, 64);
++	current = makeLabel(*this, &taskfont20, 68);
++	lv_label_set_long_mode(current, LV_LABEL_LONG_SCROLL_CIRCULAR);   // long names scroll
++	line2 = makeLine(*this, 87);
++	next = makeLabel(*this, &taskfont12, 90);
++
++	// first loop() paints it; LockSkin sets main's default bg after constructing us
++}
++
++void TaskFace::loop(){
++	const int64_t now = calNowLocal();
++	if(now / 60 != shownMinute || CalendarStore::get().revision() != shownRev){
++		refresh(now);
++	}
++}
++
++void TaskFace::refresh(int64_t now){
++	auto& store = CalendarStore::get();
++	shownRev = store.revision();
++	shownMinute = now / 60;
++
++	const auto cur = store.current(now);
++	std::optional<CalEvent> nxt;
++	for(const auto& e : store.upcoming(now, 12)){
++		if(!e.allDay && !e.cancelled && e.start > now){ nxt = e; break; }
++	}
++
++	const uint32_t rgb = cur ? cur->color : 0;
++	const lv_color_t fg = taskFg(rgb);
++	lv_obj_set_style_bg_color(bgTarget, taskBg(rgb), 0);
++	lv_obj_set_style_bg_opa(bgTarget, LV_OPA_COVER, 0);
++
++	for(auto l : { time, date, current, next }) lv_obj_set_style_text_color(l, fg, 0);
++	for(auto l : { line1, line2 }) lv_obj_set_style_bg_color(l, fg, 0);
++
++	char buf[64];
++	const time_t t = (time_t) now;
++	tm tmv = {};
++	gmtime_r(&t, &tmv);
++	strftime(buf, sizeof(buf), "%H:%M", &tmv);
++	lv_label_set_text(time, buf);
++	strftime(buf, sizeof(buf), "%a %d %b", &tmv);
++	for(char* c = buf; *c; c++) *c = (char) toupper((unsigned char) *c);
++	lv_label_set_text(date, buf);
++
++	const lv_img_dsc_t* img = cur ? task_icon(cur->icon) : nullptr;
++	if(img != nullptr){
++		lv_img_set_src(icon, img);
++		lv_obj_set_style_img_recolor(icon, fg, 0);
++		lv_obj_set_style_img_recolor_opa(icon, LV_OPA_COVER, 0);
++		lv_obj_clear_flag(icon, LV_OBJ_FLAG_HIDDEN);
++	}else{
++		lv_obj_add_flag(icon, LV_OBJ_FLAG_HIDDEN);
++	}
++
++	lv_label_set_text(current, cur ? cur->title.c_str() : "Free time");
++	lv_obj_set_style_text_opa(current, cur ? LV_OPA_COVER : LV_OPA_60, 0);
++
++	if(nxt){
++		const time_t s = (time_t) nxt->start;
++		tm ts = {};
++		gmtime_r(&s, &ts);
++		if(ts.tm_yday == tmv.tm_yday && ts.tm_year == tmv.tm_year){
++			snprintf(buf, sizeof(buf), "%02d:%02d %s", ts.tm_hour, ts.tm_min, nxt->title.c_str());
++		}else{
++			char day[8];
++			strftime(day, sizeof(day), "%a", &ts);
++			snprintf(buf, sizeof(buf), "%s %02d:%02d %s", day, ts.tm_hour, ts.tm_min, nxt->title.c_str());
++		}
++		lv_label_set_text(next, buf);
++	}else{
++		lv_label_set_text(next, "");
++	}
++}
+diff --git a/main/src/Screens/Lock/TaskFace.h b/main/src/Screens/Lock/TaskFace.h
+new file mode 100644
+index 0000000..ea6a5b5
+--- /dev/null
++++ b/main/src/Screens/Lock/TaskFace.h
+@@ -0,0 +1,30 @@
++#ifndef ARTEMIS_FIRMWARE_TASKFACE_H
++#define ARTEMIS_FIRMWARE_TASKFACE_H
++
++#include "LV_Interface/LVObject.h"
++#include <cstdint>
++
++// Watch face drawn over the lock screen: task icon, big time, date, current task (large)
++// and the next one with its start time. The background takes the current task's color.
++class TaskFace : public LVObject {
++public:
++	explicit TaskFace(lv_obj_t* parent);
++	void loop();
++
++private:
++	void refresh(int64_t now);
++
++	lv_obj_t* bgTarget;
++	lv_obj_t* icon;
++	lv_obj_t* time;
++	lv_obj_t* date;
++	lv_obj_t* line1;
++	lv_obj_t* current;
++	lv_obj_t* line2;
++	lv_obj_t* next;
++
++	uint32_t shownRev = 0;
++	int64_t shownMinute = -1;
++};
++
++#endif //ARTEMIS_FIRMWARE_TASKFACE_H
+diff --git a/main/src/Screens/MainMenu/MainMenu.cpp b/main/src/Screens/MainMenu/MainMenu.cpp
+index 60fd4aa..02e9e10 100644
+--- a/main/src/Screens/MainMenu/MainMenu.cpp
++++ b/main/src/Screens/MainMenu/MainMenu.cpp
+@@ -3,6 +3,7 @@
+ #include "MenuItemAlt.h"
+ #include "Screens/Lock/LockScreen.h"
+ #include "Screens/Level.h"
++#include "Screens/Agenda/AgendaScreen.h"
+ #include "Screens/Theremin/Theremin.h"
+ #include "Screens/PerseCtrl/PerseCtrlScreen.h"
+ #include "Screens/Settings/SettingsScreen.h"
+@@ -210,7 +211,7 @@ void MainMenu::onClick(){
+ 			[this](){ transition([](){ return std::make_unique<Level>(); }); },
+ 			[this](){ transition([](){ return std::make_unique<Theremin>(); }); },
+ 			[](){ },
+-			[this](){ transition([](){ return std::make_unique<PerseCtrlScreen>(); }); },
++			[this](){ transition([](){ return std::make_unique<AgendaScreen>(); }); }, // was PerseCtrlScreen (rover); reuses its slot and icon
+ 			[this](){ transition([](){ return std::make_unique<SettingsScreen>(); }); }
+ 	};
+ 
+diff --git a/main/src/Screens/MainMenu/MainMenu.h b/main/src/Screens/MainMenu/MainMenu.h
+index 34f49d9..f20c57f 100644
+--- a/main/src/Screens/MainMenu/MainMenu.h
++++ b/main/src/Screens/MainMenu/MainMenu.h
+@@ -38,7 +38,7 @@ private:
+ 			{ "Level",            nullptr,                                File::Menu::Theme1::Level,      nullptr },
+ 			{ "Theremin",         nullptr,                                File::Menu::Theme1::Theremin,   nullptr },
+ 			{ "Phone connection", ConnDesc[(int) Phone::PhoneType::None], File::Menu::Theme1::Connection, File::Menu::Theme1::Connection },
+-			{ "Rover control",	  nullptr,                                File::Menu::Theme1::Rover,   	  nullptr },
++			{ "Agenda",			  nullptr,                                File::Menu::Theme1::Rover,   	  nullptr },
+ 			{ "Settings",         nullptr,                                File::Menu::Theme1::Settings,   nullptr }
+ 	};
+ 	static constexpr uint8_t ItemCount = sizeof(ItemInfos) / sizeof(ItemInfos[0]);
+diff --git a/main/src/Services/BacklightBrightness.cpp b/main/src/Services/BacklightBrightness.cpp
+index c50c04b..dabb469 100644
+--- a/main/src/Services/BacklightBrightness.cpp
++++ b/main/src/Services/BacklightBrightness.cpp
+@@ -1,4 +1,5 @@
+ #include "BacklightBrightness.h"
++#include "Calendar/NightMode.h"
+ #include <algorithm>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/task.h>
+@@ -34,7 +35,7 @@ void BacklightBrightness::fadeIn(){
+ 	Settings& settings = *(Settings*) Services.get(Service::Settings);
+ 
+ 	for(uint8_t i = 0; i < 100; i++){
+-		uint8_t val = map(i, 0, 100, 0, mapDuty(settings.get().screenBrightness));
++		uint8_t val = map(i, 0, 100, 0, mapDuty(NightMode::active() ? 0 : settings.get().screenBrightness));
+ 		pwm.setDuty(val);
+ 		vTaskDelay(FadeDelay / portTICK_PERIOD_MS);
+ 	}
+@@ -47,7 +48,7 @@ void BacklightBrightness::fadeOut(){
+ 	Settings& settings = *(Settings*) Services.get(Service::Settings);
+ 
+ 	for(uint8_t i = 100; i > 0; i--){
+-		uint8_t val = map(i, 0, 100, 0, mapDuty(settings.get().screenBrightness));
++		uint8_t val = map(i, 0, 100, 0, mapDuty(NightMode::active() ? 0 : settings.get().screenBrightness));
+ 		pwm.setDuty(val);
+ 		vTaskDelay(FadeDelay / portTICK_PERIOD_MS);
+ 	}
+diff --git a/main/src/Services/SleepMan.cpp b/main/src/Services/SleepMan.cpp
+index c5aa2cb..dc48ee8 100644
+--- a/main/src/Services/SleepMan.cpp
++++ b/main/src/Services/SleepMan.cpp
+@@ -121,7 +121,15 @@ void SleepMan::shutdown(){
+ 	gpio_config(&cfg);
+ }
+ 
++void SleepMan::requestSleep(){
++	sleepRequested = true;
++}
++
+ void SleepMan::loop(){
++	if(sleepRequested.exchange(false) && !inSleep){
++		goSleep();
++		return;
++	}
+ 	checkAutoSleep();
+ 	checkEvents();
+ }
+diff --git a/main/src/Services/SleepMan.h b/main/src/Services/SleepMan.h
+index f149389..74e217d 100644
+--- a/main/src/Services/SleepMan.h
++++ b/main/src/Services/SleepMan.h
+@@ -8,6 +8,8 @@
+ #include "LV_Interface/LVGL.h"
+ #include <memory>
+ 
++#include <atomic>
++
+ class SleepMan {
+ public:
+ 	explicit SleepMan(LVGL& lvgl);
+@@ -20,6 +22,8 @@ public:
+ 	static constexpr uint32_t ShutdownTime = 5000; //5s
+ 
+ 	void wake(bool blockLockScreen = false);
++	// Turn the screen off now; safe to call from any thread (the SleepMan task does the work)
++	void requestSleep();
+ 	void imuSignal();
+ 	void shutdown();
+ 
+@@ -34,6 +38,7 @@ private:
+ 	Settings& settings;
+ 
+ 	void goSleep();
++	std::atomic<bool> sleepRequested{ false };
+ 
+ 	volatile bool inSleep = false;
+ 
+diff --git a/main/src/Services/StatusCenter.cpp b/main/src/Services/StatusCenter.cpp
+index 0ad3540..42b28c6 100644
+--- a/main/src/Services/StatusCenter.cpp
++++ b/main/src/Services/StatusCenter.cpp
+@@ -1,4 +1,5 @@
+ #include "StatusCenter.h"
++#include "Calendar/NightMode.h"
+ #include "Util/Services.h"
+ #include "SleepMan.h"
+ #include "Pins.hpp"
+@@ -57,13 +58,23 @@ void StatusCenter::processPhone(const Phone::Event& evt){
+ 	hasNotifs = !phone->getNotifs().empty();
+ 
+ 	if((evt.action == Phone::Event::Added || evt.action == Phone::Event::Changed)){
++		const bool added = evt.action == Phone::Event::Added;
++		const bool reminder = added && phone->getNotif(evt.data.addChgRem.id).category == Notif::Category::Schedule;
++
+ 		if(settings.get().notificationSounds && !audioBlocked){
+-			beep();
++			if(reminder) reminderBeep();
++			else if(added) notifBeep();
++			else beep();               // content update of an existing notification: keep it subtle
+ 		}
+ 
+-		if(settings.get().ledEnable){
++		if(ledsOn()){
+ 			circularBlink();
+ 		}
++
++		// Light the screen so the notification is readable without pressing a button
++		if(added){
++			if(auto sleep = (SleepMan*) Services.get(Service::Sleep)) sleep->wake();
++		}
+ 	}
+ }
+ 
+@@ -91,8 +102,12 @@ void StatusCenter::processBatt(const Battery::Event& evt){
+ 	updateLED();
+ }
+ 
++bool StatusCenter::ledsOn(){
++	return settings.get().ledEnable && !NightMode::active();
++}
++
+ void StatusCenter::updateLED(){
+-	if(!settings.get().ledEnable){
++	if(!ledsOn()){
+ 		led->clear();
+ 		for(const std::shared_ptr<DigitalLEDController>& singleLed : singleLeds){
+ 			singleLed->clear();
+@@ -116,7 +131,7 @@ void StatusCenter::blockAudio(bool block){
+ }
+ 
+ void StatusCenter::blink(){
+-	if(settings.get().ledEnable == false) return;
++	if(ledsOn() == false) return;
+ 
+ 	led->blinkTwice({ 0, 0, 255 });
+ 
+@@ -126,7 +141,7 @@ void StatusCenter::blink(){
+ }
+ 
+ void StatusCenter::circularBlink(){
+-	if(settings.get().ledEnable == false) return;
++	if(ledsOn() == false) return;
+ 
+ 	for(const std::shared_ptr<DigitalLEDController>& singleLed : singleLeds){
+ 		singleLed->blinkTwice(0xFF, 100, 300);
+@@ -142,6 +157,30 @@ void StatusCenter::beep(){
+ 	});
+ }
+ 
++// Small piezo buzzers are loudest around 2-4 kHz; the stock 400-600 Hz beep is barely audible.
++// If yours sounds weak, try moving ToneA/ToneB within 2000..4000.
++static constexpr uint16_t ToneA = 2700;
++static constexpr uint16_t ToneB = 3200;
++
++void StatusCenter::notifBeep(){
++	chirp.play({
++		Chirp{ .startFreq = ToneA, .endFreq = ToneA, .duration = 120 },
++		Chirp{ .startFreq = 0, .endFreq = 0, .duration = 80 },
++		Chirp{ .startFreq = ToneB, .endFreq = ToneB, .duration = 160 }
++	});
++}
++
++void StatusCenter::reminderBeep(){
++	chirp.play({
++		Chirp{ .startFreq = ToneA, .endFreq = ToneA, .duration = 150 }, Chirp{ .startFreq = 0, .endFreq = 0, .duration = 80 },
++		Chirp{ .startFreq = ToneB, .endFreq = ToneB, .duration = 150 }, Chirp{ .startFreq = 0, .endFreq = 0, .duration = 300 },
++		Chirp{ .startFreq = ToneA, .endFreq = ToneA, .duration = 150 }, Chirp{ .startFreq = 0, .endFreq = 0, .duration = 80 },
++		Chirp{ .startFreq = ToneB, .endFreq = ToneB, .duration = 150 }, Chirp{ .startFreq = 0, .endFreq = 0, .duration = 300 },
++		Chirp{ .startFreq = ToneA, .endFreq = ToneA, .duration = 150 }, Chirp{ .startFreq = 0, .endFreq = 0, .duration = 80 },
++		Chirp{ .startFreq = ToneB, .endFreq = ToneB, .duration = 400 }
++	});
++}
++
+ void StatusCenter::shutdown(){
+ 	led->setSolid({ 150, 0, 0 });
+ 	vTaskDelay(SleepMan::ShutdownTime-100);
+@@ -156,7 +195,7 @@ void StatusCenter::shutdown(){
+ }
+ 
+ void StatusCenter::blinkUp(){
+-	if(settings.get().ledEnable == false) return;
++	if(ledsOn() == false) return;
+ 
+ 	auto* settings = (Settings*) Services.get(Service::Settings);
+ 	if(settings->get().screenRotate){
+@@ -169,7 +208,7 @@ void StatusCenter::blinkUp(){
+ }
+ 
+ void StatusCenter::blinkDown(){
+-	if(settings.get().ledEnable == false) return;
++	if(ledsOn() == false) return;
+ 
+ 	auto* settings = (Settings*) Services.get(Service::Settings);
+ 	if(settings->get().screenRotate){
+@@ -182,7 +221,7 @@ void StatusCenter::blinkDown(){
+ }
+ 
+ void StatusCenter::blinkRand(){
+-	if(settings.get().ledEnable == false) return;
++	if(ledsOn() == false) return;
+ 
+ 	std::unordered_set<int> leds;
+ 	while(leds.size() < 2){
+@@ -195,7 +234,7 @@ void StatusCenter::blinkRand(){
+ }
+ 
+ void StatusCenter::blinkAll(){
+-	if(settings.get().ledEnable == false) return;
++	if(ledsOn() == false) return;
+ 
+ 	for(const auto& singleLed : singleLeds){
+ 		singleLed->blink(0xff);
+@@ -203,7 +242,7 @@ void StatusCenter::blinkAll(){
+ }
+ 
+ void StatusCenter::blinkAllTwice(){
+-	if(settings.get().ledEnable == false) return;
++	if(ledsOn() == false) return;
+ 
+ 	for(const auto& singleLed : singleLeds){
+ 		singleLed->blinkTwice(0xff);
+diff --git a/main/src/Services/StatusCenter.h b/main/src/Services/StatusCenter.h
+index d09e350..829f401 100644
+--- a/main/src/Services/StatusCenter.h
++++ b/main/src/Services/StatusCenter.h
+@@ -18,9 +18,12 @@ public:
+ 	void blockAudio(bool block);
+ 
+ 	void updateLED();
++	bool ledsOn();   // user setting AND not night mode
+ 	void blink();
+ 	void circularBlink();
+ 	void beep();
++	void notifBeep();     // new notification: louder, near the piezo's resonance
++	void reminderBeep();  // calendar reminder: ~2 s alarm pattern
+ 	void shutdown();
+ 
+ 	void blinkUp();
+diff --git a/main/src/Theme/facetime36.c b/main/src/Theme/facetime36.c
+new file mode 100644
+index 0000000..bae20a1
+--- /dev/null
++++ b/main/src/Theme/facetime36.c
+@@ -0,0 +1,187 @@
++/*******************************************************************************
++ * Size: 36 px
++ * Bpp: 1
++ * Opts: --font vt323.ttf -r 0x20,0x30-0x3A --size 36 --bpp 1 --format lvgl --no-compress --lv-include lvgl.h -o facetime36.c
++ ******************************************************************************/
++
++#ifdef LV_LVGL_H_INCLUDE_SIMPLE
++#include "lvgl.h"
++#else
++#include "lvgl.h"
++#endif
++
++#ifndef FACETIME36
++#define FACETIME36 1
++#endif
++
++#if FACETIME36
++
++/*-----------------
++ *    BITMAPS
++ *----------------*/
++
++/*Store the image of the glyphs*/
++static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
++    /* U+0020 " " */
++    0x0,
++
++    /* U+0030 "0" */
++    0x1e, 0x7, 0x81, 0xe1, 0x86, 0x61, 0x98, 0x6e,
++    0x1f, 0x87, 0xe1, 0xf8, 0x7e, 0x1f, 0x87, 0xe1,
++    0xf8, 0x7e, 0x1d, 0x86, 0x61, 0x98, 0x61, 0xe0,
++    0x78, 0x1e, 0x0,
++
++    /* U+0031 "1" */
++    0x1c, 0xe, 0x7, 0xf, 0x87, 0xc3, 0xe0, 0x70,
++    0x38, 0x1c, 0xe, 0x7, 0x3, 0x81, 0xc0, 0xe0,
++    0x70, 0x38, 0x1c, 0xe, 0x1f, 0xff, 0xf7, 0xf8,
++
++    /* U+0032 "2" */
++    0x3f, 0x8f, 0xe3, 0xfb, 0x87, 0xe1, 0xf8, 0x70,
++    0x1c, 0x7, 0x1, 0xc1, 0xc0, 0x70, 0x1c, 0xe,
++    0x3, 0x80, 0xe0, 0xe0, 0x38, 0xe, 0xf, 0xff,
++    0xff, 0xff, 0xc0,
++
++    /* U+0033 "3" */
++    0x3f, 0x8f, 0xe3, 0xfb, 0x87, 0xe1, 0xf8, 0x70,
++    0x1c, 0x7, 0x1, 0xc7, 0xe1, 0xf8, 0x7e, 0x1,
++    0xc0, 0x70, 0x1f, 0x87, 0xe1, 0xf8, 0x73, 0xf8,
++    0xfe, 0x3f, 0x80,
++
++    /* U+0034 "4" */
++    0x7, 0xe0, 0x7e, 0x7, 0xe1, 0x8e, 0x18, 0xe1,
++    0x8e, 0x30, 0xe3, 0xe, 0x30, 0xe6, 0xe, 0x60,
++    0xe6, 0xe, 0xff, 0xef, 0xff, 0xff, 0xe0, 0xe,
++    0x0, 0xe0, 0xe, 0x0, 0xe0, 0xe, 0x0, 0xe0,
++
++    /* U+0035 "5" */
++    0xff, 0xdf, 0xfb, 0xff, 0x70, 0xe, 0x1, 0xc0,
++    0x3b, 0xc7, 0x78, 0xef, 0x1e, 0x3b, 0xc7, 0x78,
++    0xe0, 0xe, 0x1, 0xc0, 0x3f, 0xe, 0xe1, 0xdc,
++    0x39, 0xfc, 0x3f, 0x87, 0xf0,
++
++    /* U+0036 "6" */
++    0xf, 0xc1, 0xf8, 0x3f, 0x38, 0x7, 0x0, 0xe0,
++    0x38, 0x7, 0x0, 0xe0, 0x1d, 0xfb, 0xbf, 0x77,
++    0xef, 0xf, 0xe1, 0xfc, 0x3b, 0x87, 0x70, 0xee,
++    0x1c, 0x3e, 0x7, 0xc0, 0xf8,
++
++    /* U+0037 "7" */
++    0xff, 0xff, 0xff, 0xfc, 0x7, 0x1, 0xc0, 0x70,
++    0x38, 0xe, 0x3, 0x81, 0xc0, 0x70, 0x1c, 0xe,
++    0x3, 0x80, 0xe0, 0x70, 0x1c, 0x7, 0x3, 0x80,
++    0xe0, 0x38, 0x0,
++
++    /* U+0038 "8" */
++    0x3f, 0xf, 0xc3, 0xf3, 0x87, 0xe1, 0xf8, 0x7e,
++    0x1f, 0x87, 0xe1, 0xcf, 0xc3, 0xf0, 0xfc, 0xe1,
++    0xf8, 0x7e, 0x1f, 0x87, 0xe1, 0xf8, 0x73, 0xf0,
++    0xfc, 0x3f, 0x0,
++
++    /* U+0039 "9" */
++    0x3e, 0x7, 0xc0, 0xf8, 0x70, 0xee, 0x1d, 0xc3,
++    0xb8, 0x7f, 0xf, 0xe1, 0xef, 0xdd, 0xfb, 0xbf,
++    0x70, 0xe, 0x1, 0xc0, 0x38, 0xe, 0x1, 0xc0,
++    0x39, 0xf8, 0x3f, 0x7, 0xe0,
++
++    /* U+003A ":" */
++    0xff, 0xff, 0xff, 0x0, 0x0, 0x0, 0xff, 0xff,
++    0xff
++};
++
++
++/*---------------------
++ *  GLYPH DESCRIPTION
++ *--------------------*/
++
++static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
++    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0} /* id = 0 reserved */,
++    {.bitmap_index = 0, .adv_w = 230, .box_w = 1, .box_h = 1, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 1, .adv_w = 230, .box_w = 10, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 28, .adv_w = 230, .box_w = 9, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 52, .adv_w = 230, .box_w = 10, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 79, .adv_w = 230, .box_w = 10, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 106, .adv_w = 230, .box_w = 12, .box_h = 21, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 138, .adv_w = 230, .box_w = 11, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 167, .adv_w = 230, .box_w = 11, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 196, .adv_w = 230, .box_w = 10, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 223, .adv_w = 230, .box_w = 10, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 250, .adv_w = 230, .box_w = 11, .box_h = 21, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 279, .adv_w = 230, .box_w = 4, .box_h = 18, .ofs_x = 5, .ofs_y = 0}
++};
++
++/*---------------------
++ *  CHARACTER MAPPING
++ *--------------------*/
++
++
++
++/*Collect the unicode lists and glyph_id offsets*/
++static const lv_font_fmt_txt_cmap_t cmaps[] =
++{
++    {
++        .range_start = 32, .range_length = 1, .glyph_id_start = 1,
++        .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
++    },
++    {
++        .range_start = 48, .range_length = 11, .glyph_id_start = 2,
++        .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
++    }
++};
++
++
++
++/*--------------------
++ *  ALL CUSTOM DATA
++ *--------------------*/
++
++#if LV_VERSION_CHECK(8, 0, 0)
++/*Store all the custom data of the font*/
++static  lv_font_fmt_txt_glyph_cache_t cache;
++static const lv_font_fmt_txt_dsc_t font_dsc = {
++#else
++static lv_font_fmt_txt_dsc_t font_dsc = {
++#endif
++    .glyph_bitmap = glyph_bitmap,
++    .glyph_dsc = glyph_dsc,
++    .cmaps = cmaps,
++    .kern_dsc = NULL,
++    .kern_scale = 0,
++    .cmap_num = 2,
++    .bpp = 1,
++    .kern_classes = 0,
++    .bitmap_format = 0,
++#if LV_VERSION_CHECK(8, 0, 0)
++    .cache = &cache
++#endif
++};
++
++
++/*-----------------
++ *  PUBLIC FONT
++ *----------------*/
++
++/*Initialize a public general font descriptor*/
++#if LV_VERSION_CHECK(8, 0, 0)
++const lv_font_t facetime36 = {
++#else
++lv_font_t facetime36 = {
++#endif
++    .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,    /*Function pointer to get glyph's data*/
++    .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,    /*Function pointer to get glyph's bitmap*/
++    .line_height = 21,          /*The maximum line height required by the font*/
++    .base_line = 0,             /*Baseline measured from the bottom of the line*/
++#if !(LVGL_VERSION_MAJOR == 6 && LVGL_VERSION_MINOR == 0)
++    .subpx = LV_FONT_SUBPX_NONE,
++#endif
++#if LV_VERSION_CHECK(7, 4, 0) || LVGL_VERSION_MAJOR >= 8
++    .underline_position = -4,
++    .underline_thickness = 2,
++#endif
++    .dsc = &font_dsc           /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */
++};
++
++
++
++#endif /*#if FACETIME36*/
++
+diff --git a/main/src/Theme/taskfont12.c b/main/src/Theme/taskfont12.c
+new file mode 100644
+index 0000000..686c6ee
+--- /dev/null
++++ b/main/src/Theme/taskfont12.c
+@@ -0,0 +1,485 @@
++/*******************************************************************************
++ * Size: 12 px
++ * Bpp: 1
++ * Opts: --font vt323.ttf -r 0x20-0x7E --size 12 --bpp 1 --format lvgl --no-compress --lv-include lvgl.h -o taskfont12.c
++ ******************************************************************************/
++
++#ifdef LV_LVGL_H_INCLUDE_SIMPLE
++#include "lvgl.h"
++#else
++#include "lvgl.h"
++#endif
++
++#ifndef TASKFONT12
++#define TASKFONT12 1
++#endif
++
++#if TASKFONT12
++
++/*-----------------
++ *    BITMAPS
++ *----------------*/
++
++/*Store the image of the glyphs*/
++static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
++    /* U+0020 " " */
++    0x0,
++
++    /* U+0021 "!" */
++    0xfa,
++
++    /* U+0022 "\"" */
++    0xb4,
++
++    /* U+0023 "#" */
++    0x5f, 0x55, 0xf5,
++
++    /* U+0024 "$" */
++    0x27, 0xba, 0x73, 0xb7, 0x20,
++
++    /* U+0025 "%" */
++    0x5d, 0x62, 0x57, 0x90,
++
++    /* U+0026 "&" */
++    0x66, 0x77, 0x9b, 0x70,
++
++    /* U+0027 "'" */
++    0xc0,
++
++    /* U+0028 "(" */
++    0xff, 0x80,
++
++    /* U+0029 ")" */
++    0x95, 0x55, 0x80,
++
++    /* U+002A "*" */
++    0x5d, 0x74,
++
++    /* U+002B "+" */
++    0x4b, 0xa4,
++
++    /* U+002C "," */
++    0xf0,
++
++    /* U+002D "-" */
++    0xe0,
++
++    /* U+002E "." */
++    0xc0,
++
++    /* U+002F "/" */
++    0x11, 0x12, 0x22, 0x44, 0x80,
++
++    /* U+0030 "0" */
++    0x56, 0xdb, 0x50,
++
++    /* U+0031 "1" */
++    0x59, 0x24, 0xb8,
++
++    /* U+0032 "2" */
++    0xf4, 0xb5, 0x38,
++
++    /* U+0033 "3" */
++    0xf4, 0xb3, 0x78,
++
++    /* U+0034 "4" */
++    0x35, 0x59, 0xf1, 0x10,
++
++    /* U+0035 "5" */
++    0xf3, 0x53, 0x70,
++
++    /* U+0036 "6" */
++    0x72, 0x7b, 0x50,
++
++    /* U+0037 "7" */
++    0xe4, 0xa4, 0xa0,
++
++    /* U+0038 "8" */
++    0xd6, 0xeb, 0x70,
++
++    /* U+0039 "9" */
++    0xd6, 0xf2, 0x70,
++
++    /* U+003A ":" */
++    0xcc,
++
++    /* U+003B ";" */
++    0xcf,
++
++    /* U+003C "<" */
++    0x29, 0x44, 0x88,
++
++    /* U+003D "=" */
++    0xe3, 0x80,
++
++    /* U+003E ">" */
++    0x89, 0x14, 0xa0,
++
++    /* U+003F "?" */
++    0x79, 0x13, 0x20, 0x20,
++
++    /* U+0040 "@" */
++    0x65, 0xbb, 0xbb, 0x47,
++
++    /* U+0041 "A" */
++    0x26, 0x55, 0x79, 0x90,
++
++    /* U+0042 "B" */
++    0xf9, 0x9f, 0x99, 0xf0,
++
++    /* U+0043 "C" */
++    0x75, 0x88, 0x85, 0x70,
++
++    /* U+0044 "D" */
++    0xe9, 0x99, 0x99, 0xe0,
++
++    /* U+0045 "E" */
++    0xf2, 0x79, 0x38,
++
++    /* U+0046 "F" */
++    0xf2, 0x79, 0x20,
++
++    /* U+0047 "G" */
++    0x75, 0x89, 0x95, 0x70,
++
++    /* U+0048 "H" */
++    0x99, 0x9f, 0x99, 0x90,
++
++    /* U+0049 "I" */
++    0xe9, 0x24, 0xb8,
++
++    /* U+004A "J" */
++    0x32, 0x22, 0x2a, 0x60,
++
++    /* U+004B "K" */
++    0x99, 0xae, 0xa9, 0x90,
++
++    /* U+004C "L" */
++    0x92, 0x49, 0x38,
++
++    /* U+004D "M" */
++    0xdd, 0xdb, 0xbb, 0x90,
++
++    /* U+004E "N" */
++    0xdd, 0xdb, 0xb9, 0x90,
++
++    /* U+004F "O" */
++    0x65, 0x99, 0x95, 0x60,
++
++    /* U+0050 "P" */
++    0xf9, 0x9f, 0x88, 0x80,
++
++    /* U+0051 "Q" */
++    0x65, 0x99, 0x95, 0x61, 0x10,
++
++    /* U+0052 "R" */
++    0xf9, 0x9e, 0x99, 0x90,
++
++    /* U+0053 "S" */
++    0x79, 0x87, 0x19, 0x70,
++
++    /* U+0054 "T" */
++    0xf2, 0x22, 0x22, 0x20,
++
++    /* U+0055 "U" */
++    0x99, 0x99, 0x99, 0x70,
++
++    /* U+0056 "V" */
++    0x99, 0x95, 0x56, 0x20,
++
++    /* U+0057 "W" */
++    0xbb, 0xbb, 0xb5, 0x50,
++
++    /* U+0058 "X" */
++    0x95, 0x52, 0x55, 0x90,
++
++    /* U+0059 "Y" */
++    0x99, 0x56, 0x22, 0x20,
++
++    /* U+005A "Z" */
++    0xe4, 0xa9, 0x38,
++
++    /* U+005B "[" */
++    0xff, 0x80,
++
++    /* U+005C "\\" */
++    0x84, 0x42, 0x22, 0x11, 0x10,
++
++    /* U+005D "]" */
++    0xd5, 0x55, 0xc0,
++
++    /* U+005E "^" */
++    0x26, 0x59,
++
++    /* U+005F "_" */
++    0xf0,
++
++    /* U+0060 "`" */
++    0x90,
++
++    /* U+0061 "a" */
++    0x61, 0x79, 0x70,
++
++    /* U+0062 "b" */
++    0x88, 0xad, 0x99, 0xe0,
++
++    /* U+0063 "c" */
++    0x75, 0x85, 0x70,
++
++    /* U+0064 "d" */
++    0x11, 0x75, 0x95, 0x70,
++
++    /* U+0065 "e" */
++    0x75, 0xf4, 0x70,
++
++    /* U+0066 "f" */
++    0x73, 0xc9, 0x30,
++
++    /* U+0067 "g" */
++    0x75, 0x95, 0x71, 0x60,
++
++    /* U+0068 "h" */
++    0x88, 0xbd, 0x99, 0x90,
++
++    /* U+0069 "i" */
++    0x43, 0x24, 0xb8,
++
++    /* U+006A "j" */
++    0x4d, 0x55, 0x80,
++
++    /* U+006B "k" */
++    0x88, 0x9a, 0xea, 0x90,
++
++    /* U+006C "l" */
++    0xc9, 0x24, 0xb8,
++
++    /* U+006D "m" */
++    0xdb, 0xbb, 0xb0,
++
++    /* U+006E "n" */
++    0xbd, 0x99, 0x90,
++
++    /* U+006F "o" */
++    0x65, 0x95, 0x60,
++
++    /* U+0070 "p" */
++    0xad, 0x99, 0xe8, 0x80,
++
++    /* U+0071 "q" */
++    0x75, 0x95, 0x71, 0x10,
++
++    /* U+0072 "r" */
++    0xf7, 0x44, 0xe0,
++
++    /* U+0073 "s" */
++    0xf3, 0x9e,
++
++    /* U+0074 "t" */
++    0x44, 0xf4, 0x44, 0x30,
++
++    /* U+0075 "u" */
++    0x99, 0x9d, 0x70,
++
++    /* U+0076 "v" */
++    0x95, 0x56, 0x20,
++
++    /* U+0077 "w" */
++    0xbb, 0xb5, 0x50,
++
++    /* U+0078 "x" */
++    0xb5, 0x5a,
++
++    /* U+0079 "y" */
++    0x95, 0x56, 0x22, 0x40,
++
++    /* U+007A "z" */
++    0xe5, 0x4e,
++
++    /* U+007B "{" */
++    0x69, 0x28, 0x92, 0x60,
++
++    /* U+007C "|" */
++    0xff, 0x80,
++
++    /* U+007D "}" */
++    0x89, 0x26, 0x92, 0x80,
++
++    /* U+007E "~" */
++    0x57, 0xbb
++};
++
++
++/*---------------------
++ *  GLYPH DESCRIPTION
++ *--------------------*/
++
++static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
++    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0} /* id = 0 reserved */,
++    {.bitmap_index = 0, .adv_w = 77, .box_w = 1, .box_h = 1, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 1, .adv_w = 77, .box_w = 1, .box_h = 7, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 2, .adv_w = 77, .box_w = 3, .box_h = 2, .ofs_x = 1, .ofs_y = 6},
++    {.bitmap_index = 3, .adv_w = 77, .box_w = 4, .box_h = 6, .ofs_x = 0, .ofs_y = 1},
++    {.bitmap_index = 6, .adv_w = 77, .box_w = 4, .box_h = 9, .ofs_x = 0, .ofs_y = -1},
++    {.bitmap_index = 11, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 15, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 19, .adv_w = 77, .box_w = 1, .box_h = 2, .ofs_x = 2, .ofs_y = 6},
++    {.bitmap_index = 20, .adv_w = 77, .box_w = 1, .box_h = 9, .ofs_x = 2, .ofs_y = -1},
++    {.bitmap_index = 22, .adv_w = 77, .box_w = 2, .box_h = 9, .ofs_x = 1, .ofs_y = -1},
++    {.bitmap_index = 25, .adv_w = 77, .box_w = 3, .box_h = 5, .ofs_x = 1, .ofs_y = 1},
++    {.bitmap_index = 27, .adv_w = 77, .box_w = 3, .box_h = 5, .ofs_x = 1, .ofs_y = 1},
++    {.bitmap_index = 29, .adv_w = 77, .box_w = 1, .box_h = 4, .ofs_x = 2, .ofs_y = -2},
++    {.bitmap_index = 30, .adv_w = 77, .box_w = 3, .box_h = 1, .ofs_x = 1, .ofs_y = 3},
++    {.bitmap_index = 31, .adv_w = 77, .box_w = 1, .box_h = 2, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 32, .adv_w = 77, .box_w = 4, .box_h = 9, .ofs_x = 0, .ofs_y = -1},
++    {.bitmap_index = 37, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 40, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 43, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 46, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 49, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 53, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 56, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 59, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 62, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 65, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 68, .adv_w = 77, .box_w = 1, .box_h = 6, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 69, .adv_w = 77, .box_w = 1, .box_h = 8, .ofs_x = 2, .ofs_y = -2},
++    {.bitmap_index = 70, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 73, .adv_w = 77, .box_w = 3, .box_h = 3, .ofs_x = 1, .ofs_y = 2},
++    {.bitmap_index = 75, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 78, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 82, .adv_w = 77, .box_w = 4, .box_h = 8, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 86, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 90, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 94, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 98, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 102, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 105, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 108, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 112, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 116, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 119, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 123, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 127, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 130, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 134, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 138, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 142, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 146, .adv_w = 77, .box_w = 4, .box_h = 9, .ofs_x = 0, .ofs_y = -2},
++    {.bitmap_index = 151, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 155, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 159, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 163, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 167, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 171, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 175, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 179, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 183, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 186, .adv_w = 77, .box_w = 1, .box_h = 9, .ofs_x = 2, .ofs_y = -1},
++    {.bitmap_index = 188, .adv_w = 77, .box_w = 4, .box_h = 9, .ofs_x = 0, .ofs_y = -1},
++    {.bitmap_index = 193, .adv_w = 77, .box_w = 2, .box_h = 9, .ofs_x = 1, .ofs_y = -1},
++    {.bitmap_index = 196, .adv_w = 77, .box_w = 4, .box_h = 4, .ofs_x = 0, .ofs_y = 3},
++    {.bitmap_index = 198, .adv_w = 77, .box_w = 4, .box_h = 1, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 199, .adv_w = 77, .box_w = 2, .box_h = 2, .ofs_x = 1, .ofs_y = 6},
++    {.bitmap_index = 200, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 203, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 207, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 210, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 214, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 217, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 220, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = -2},
++    {.bitmap_index = 224, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 228, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 231, .adv_w = 77, .box_w = 2, .box_h = 9, .ofs_x = 1, .ofs_y = -2},
++    {.bitmap_index = 234, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 238, .adv_w = 77, .box_w = 3, .box_h = 7, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 241, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 244, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 247, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 250, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = -2},
++    {.bitmap_index = 254, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = -2},
++    {.bitmap_index = 258, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 261, .adv_w = 77, .box_w = 3, .box_h = 5, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 263, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 267, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 270, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 273, .adv_w = 77, .box_w = 4, .box_h = 5, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 276, .adv_w = 77, .box_w = 3, .box_h = 5, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 278, .adv_w = 77, .box_w = 4, .box_h = 7, .ofs_x = 0, .ofs_y = -2},
++    {.bitmap_index = 282, .adv_w = 77, .box_w = 3, .box_h = 5, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 284, .adv_w = 77, .box_w = 3, .box_h = 9, .ofs_x = 1, .ofs_y = -1},
++    {.bitmap_index = 288, .adv_w = 77, .box_w = 1, .box_h = 9, .ofs_x = 2, .ofs_y = -1},
++    {.bitmap_index = 290, .adv_w = 77, .box_w = 3, .box_h = 9, .ofs_x = 1, .ofs_y = -1},
++    {.bitmap_index = 294, .adv_w = 77, .box_w = 4, .box_h = 4, .ofs_x = 0, .ofs_y = 2}
++};
++
++/*---------------------
++ *  CHARACTER MAPPING
++ *--------------------*/
++
++
++
++/*Collect the unicode lists and glyph_id offsets*/
++static const lv_font_fmt_txt_cmap_t cmaps[] =
++{
++    {
++        .range_start = 32, .range_length = 95, .glyph_id_start = 1,
++        .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
++    }
++};
++
++
++
++/*--------------------
++ *  ALL CUSTOM DATA
++ *--------------------*/
++
++#if LV_VERSION_CHECK(8, 0, 0)
++/*Store all the custom data of the font*/
++static  lv_font_fmt_txt_glyph_cache_t cache;
++static const lv_font_fmt_txt_dsc_t font_dsc = {
++#else
++static lv_font_fmt_txt_dsc_t font_dsc = {
++#endif
++    .glyph_bitmap = glyph_bitmap,
++    .glyph_dsc = glyph_dsc,
++    .cmaps = cmaps,
++    .kern_dsc = NULL,
++    .kern_scale = 0,
++    .cmap_num = 1,
++    .bpp = 1,
++    .kern_classes = 0,
++    .bitmap_format = 0,
++#if LV_VERSION_CHECK(8, 0, 0)
++    .cache = &cache
++#endif
++};
++
++
++/*-----------------
++ *  PUBLIC FONT
++ *----------------*/
++
++/*Initialize a public general font descriptor*/
++#if LV_VERSION_CHECK(8, 0, 0)
++const lv_font_t taskfont12 = {
++#else
++lv_font_t taskfont12 = {
++#endif
++    .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,    /*Function pointer to get glyph's data*/
++    .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,    /*Function pointer to get glyph's bitmap*/
++    .line_height = 10,          /*The maximum line height required by the font*/
++    .base_line = 2,             /*Baseline measured from the bottom of the line*/
++#if !(LVGL_VERSION_MAJOR == 6 && LVGL_VERSION_MINOR == 0)
++    .subpx = LV_FONT_SUBPX_NONE,
++#endif
++#if LV_VERSION_CHECK(7, 4, 0) || LVGL_VERSION_MAJOR >= 8
++    .underline_position = -1,
++    .underline_thickness = 1,
++#endif
++    .dsc = &font_dsc           /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */
++};
++
++
++
++#endif /*#if TASKFONT12*/
++
+diff --git a/main/src/Theme/taskfont20.c b/main/src/Theme/taskfont20.c
+new file mode 100644
+index 0000000..cc14f2c
+--- /dev/null
++++ b/main/src/Theme/taskfont20.c
+@@ -0,0 +1,538 @@
++/*******************************************************************************
++ * Size: 20 px
++ * Bpp: 1
++ * Opts: --font vt323.ttf -r 0x20-0x7E --size 20 --bpp 1 --format lvgl --no-compress --lv-include lvgl.h -o taskfont20.c
++ ******************************************************************************/
++
++#ifdef LV_LVGL_H_INCLUDE_SIMPLE
++#include "lvgl.h"
++#else
++#include "lvgl.h"
++#endif
++
++#ifndef TASKFONT20
++#define TASKFONT20 1
++#endif
++
++#if TASKFONT20
++
++/*-----------------
++ *    BITMAPS
++ *----------------*/
++
++/*Store the image of the glyphs*/
++static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
++    /* U+0020 " " */
++    0x0,
++
++    /* U+0021 "!" */
++    0xff, 0xff, 0xc,
++
++    /* U+0022 "\"" */
++    0xde, 0xf6,
++
++    /* U+0023 "#" */
++    0x6c, 0xdb, 0xfb, 0x66, 0xcd, 0x9b, 0x7f, 0x6c,
++    0xd8,
++
++    /* U+0024 "$" */
++    0x30, 0x61, 0xf7, 0xbf, 0x1e, 0x1c, 0x3e, 0x36,
++    0x6f, 0xdb, 0xa7, 0xc6, 0xc, 0x0,
++
++    /* U+0025 "%" */
++    0x66, 0xcb, 0xb3, 0xc1, 0x2, 0xb, 0x16, 0x7e,
++    0x9b, 0x30,
++
++    /* U+0026 "&" */
++    0x38, 0xb3, 0x61, 0xbd, 0xfb, 0xf6, 0x6e, 0xdd,
++    0xab, 0xd8,
++
++    /* U+0027 "'" */
++    0xfc,
++
++    /* U+0028 "(" */
++    0x21, 0x25, 0xb6, 0xd9, 0x24, 0x40,
++
++    /* U+0029 ")" */
++    0x80, 0x42, 0x23, 0x33, 0x33, 0x24, 0x48,
++
++    /* U+002A "*" */
++    0x30, 0xcf, 0xcc, 0x33, 0xf3, 0xc,
++
++    /* U+002B "+" */
++    0x30, 0xc3, 0x3f, 0x30, 0xc3, 0xc,
++
++    /* U+002C "," */
++    0xff, 0xf0,
++
++    /* U+002D "-" */
++    0xf0,
++
++    /* U+002E "." */
++    0xfc,
++
++    /* U+002F "/" */
++    0x6, 0x8, 0x30, 0x40, 0x83, 0x4, 0x18, 0x30,
++    0x61, 0x86, 0xc, 0x18, 0x0,
++
++    /* U+0030 "0" */
++    0x31, 0x24, 0xb3, 0xcf, 0x3c, 0xf3, 0x48, 0x3,
++    0x0,
++
++    /* U+0031 "1" */
++    0x30, 0xc7, 0xc, 0x30, 0xc3, 0xc, 0x30, 0xcf,
++    0xc0,
++
++    /* U+0032 "2" */
++    0x7b, 0x30, 0xc3, 0x8, 0x63, 0x18, 0x61, 0x8f,
++    0xc0,
++
++    /* U+0033 "3" */
++    0x7b, 0x30, 0xc3, 0x8, 0xe0, 0xc3, 0xcd, 0x27,
++    0x80,
++
++    /* U+0034 "4" */
++    0x1c, 0x18, 0xb1, 0x64, 0xc9, 0xbf, 0x86, 0xc,
++    0x18, 0x30,
++
++    /* U+0035 "5" */
++    0xff, 0xc, 0x36, 0xcb, 0xb0, 0xc3, 0xcd, 0x27,
++    0x80,
++
++    /* U+0036 "6" */
++    0x38, 0xc, 0x30, 0xc3, 0xec, 0xf3, 0xcc, 0x43,
++    0x0,
++
++    /* U+0037 "7" */
++    0xfc, 0x30, 0xc6, 0x18, 0x63, 0xc, 0x61, 0x86,
++    0x0,
++
++    /* U+0038 "8" */
++    0x76, 0xf7, 0xb5, 0x3b, 0x7b, 0xda, 0x9c,
++
++    /* U+0039 "9" */
++    0x33, 0x6d, 0xb7, 0x4d, 0xf0, 0xc3, 0x18, 0x7,
++    0x0,
++
++    /* U+003A ":" */
++    0xfc, 0x3, 0xf0,
++
++    /* U+003B ";" */
++    0xfc, 0x3, 0xff, 0xc0,
++
++    /* U+003C "<" */
++    0x18, 0x8c, 0xc4, 0x61, 0x84, 0x30, 0x86,
++
++    /* U+003D "=" */
++    0xf8, 0x1, 0xf0,
++
++    /* U+003E ">" */
++    0xc2, 0x18, 0x61, 0xc, 0xc4, 0x62, 0x30,
++
++    /* U+003F "?" */
++    0x7b, 0x30, 0xc3, 0x8, 0x63, 0x0, 0x0, 0x3,
++    0x0,
++
++    /* U+0040 "@" */
++    0x39, 0x2c, 0xf3, 0xdf, 0xdf, 0x7d, 0xdf, 0xc,
++    0x10, 0x3c,
++
++    /* U+0041 "A" */
++    0x30, 0x70, 0xe3, 0x6e, 0xd9, 0xbf, 0x62, 0xc7,
++    0x8f, 0x18,
++
++    /* U+0042 "B" */
++    0xfd, 0x8f, 0x1e, 0x3c, 0x5f, 0xb1, 0xe3, 0xc7,
++    0x8b, 0xf0,
++
++    /* U+0043 "C" */
++    0x3c, 0x49, 0x9e, 0xc, 0x18, 0x30, 0x60, 0x66,
++    0x48, 0xf0,
++
++    /* U+0044 "D" */
++    0xf9, 0x9b, 0x36, 0x3c, 0x78, 0xf1, 0xe3, 0xcd,
++    0x93, 0xe0,
++
++    /* U+0045 "E" */
++    0xfe, 0x31, 0x8c, 0x7f, 0x18, 0xc6, 0x3e,
++
++    /* U+0046 "F" */
++    0xfe, 0x31, 0x8c, 0x7f, 0x18, 0xc6, 0x30,
++
++    /* U+0047 "G" */
++    0x3c, 0xcd, 0x6, 0xc, 0x19, 0xf1, 0xe3, 0x66,
++    0x48, 0xf0,
++
++    /* U+0048 "H" */
++    0xc7, 0x8f, 0x1e, 0x3c, 0x7f, 0xf1, 0xe3, 0xc7,
++    0x8f, 0x18,
++
++    /* U+0049 "I" */
++    0xf6, 0x66, 0x66, 0x66, 0x66, 0xf0,
++
++    /* U+004A "J" */
++    0x3c, 0x61, 0x86, 0x18, 0x61, 0x86, 0xd9, 0x47,
++    0x0,
++
++    /* U+004B "K" */
++    0xc7, 0x8b, 0x36, 0xcd, 0x1e, 0x36, 0x64, 0xcd,
++    0x8b, 0x18,
++
++    /* U+004C "L" */
++    0xc3, 0xc, 0x30, 0xc3, 0xc, 0x30, 0xc3, 0xf,
++    0xc0,
++
++    /* U+004D "M" */
++    0xc7, 0x8f, 0xbf, 0xbf, 0x7e, 0xfd, 0xfb, 0xf7,
++    0xef, 0x18,
++
++    /* U+004E "N" */
++    0xcf, 0xbe, 0xfb, 0xef, 0xfd, 0xf7, 0xdf, 0x3c,
++    0xc0,
++
++    /* U+004F "O" */
++    0x39, 0x9b, 0x36, 0x3c, 0x78, 0xf1, 0xe3, 0xcc,
++    0x90, 0xe0,
++
++    /* U+0050 "P" */
++    0xfd, 0x8f, 0x1e, 0x3c, 0x5f, 0xb0, 0x60, 0xc1,
++    0x83, 0x0,
++
++    /* U+0051 "Q" */
++    0x39, 0x9b, 0x36, 0x3c, 0x78, 0xf1, 0xe3, 0xcc,
++    0x90, 0xe0, 0x60, 0xc0, 0xc0,
++
++    /* U+0052 "R" */
++    0xfd, 0x9b, 0x3e, 0x6c, 0xdf, 0x36, 0x6c, 0xcd,
++    0x9b, 0x18,
++
++    /* U+0053 "S" */
++    0x7d, 0x8f, 0x6, 0x4, 0xf, 0x81, 0x83, 0xc6,
++    0x89, 0xf0,
++
++    /* U+0054 "T" */
++    0xfe, 0x30, 0x60, 0xc1, 0x83, 0x6, 0xc, 0x18,
++    0x30, 0x60,
++
++    /* U+0055 "U" */
++    0xc7, 0x8f, 0x1e, 0x3c, 0x78, 0xf1, 0xe3, 0xc7,
++    0x8d, 0xf0,
++
++    /* U+0056 "V" */
++    0xc7, 0x8f, 0x1e, 0x3c, 0x79, 0x9e, 0x3c, 0x38,
++    0x60, 0xc0,
++
++    /* U+0057 "W" */
++    0xd7, 0xaf, 0x5e, 0xbd, 0x7a, 0xdd, 0x3a, 0x6c,
++    0xd9, 0xb0,
++
++    /* U+0058 "X" */
++    0xc7, 0x9b, 0x33, 0xc3, 0x6, 0x1e, 0x3c, 0xcd,
++    0x8b, 0x18,
++
++    /* U+0059 "Y" */
++    0xc7, 0x8f, 0x1b, 0x66, 0xc7, 0xc, 0x18, 0x30,
++    0x60, 0xc0,
++
++    /* U+005A "Z" */
++    0xfc, 0x30, 0xc6, 0x10, 0xc6, 0x30, 0xc3, 0xf,
++    0xc0,
++
++    /* U+005B "[" */
++    0xfb, 0x6d, 0xb6, 0xdb, 0x6d, 0xc0,
++
++    /* U+005C "\\" */
++    0xc1, 0x83, 0x3, 0x6, 0x6, 0xc, 0x18, 0x18,
++    0x30, 0x20, 0x60, 0xc0, 0xc0,
++
++    /* U+005D "]" */
++    0xed, 0xb6, 0xdb, 0x6d, 0xb7, 0xc0,
++
++    /* U+005E "^" */
++    0x30, 0x70, 0xe3, 0x64, 0x58, 0xc0,
++
++    /* U+005F "_" */
++    0xfe,
++
++    /* U+0060 "`" */
++    0xc9, 0x80,
++
++    /* U+0061 "a" */
++    0x78, 0x18, 0x33, 0xe4, 0xd9, 0x91, 0x3b,
++
++    /* U+0062 "b" */
++    0xc1, 0x83, 0x6, 0xcc, 0x9d, 0xb1, 0xe2, 0xcd,
++    0x2, 0xc0,
++
++    /* U+0063 "c" */
++    0x3c, 0x49, 0x9e, 0x4, 0xc, 0xc9, 0x1e,
++
++    /* U+0064 "d" */
++    0xc, 0x30, 0xcf, 0x4f, 0x3c, 0xf3, 0xcd, 0x33,
++    0xc0,
++
++    /* U+0065 "e" */
++    0x3c, 0x49, 0x9f, 0xf6, 0xc, 0x18, 0x1e,
++
++    /* U+0066 "f" */
++    0x3b, 0x19, 0xf6, 0x31, 0x8c, 0x63, 0x3c,
++
++    /* U+0067 "g" */
++    0x3f, 0x8f, 0x1e, 0x3c, 0x79, 0xd1, 0x9b, 0xc,
++    0x18, 0xe0,
++
++    /* U+0068 "h" */
++    0xc1, 0x83, 0x7, 0xcc, 0x98, 0xf1, 0xe3, 0xc7,
++    0x8f, 0x18,
++
++    /* U+0069 "i" */
++    0x30, 0x0, 0x1c, 0x30, 0xc3, 0xc, 0x30, 0xcf,
++    0xc0,
++
++    /* U+006A "j" */
++    0x30, 0x7, 0x33, 0x33, 0x33, 0x36, 0x6c,
++
++    /* U+006B "k" */
++    0xc1, 0x83, 0x6, 0x6c, 0x9b, 0x3c, 0x6c, 0xd9,
++    0xb3, 0x38,
++
++    /* U+006C "l" */
++    0x70, 0xc3, 0xc, 0x30, 0xc3, 0xc, 0x30, 0xcf,
++    0xc0,
++
++    /* U+006D "m" */
++    0xed, 0x4b, 0xdf, 0xbf, 0x7e, 0xfd, 0xfb,
++
++    /* U+006E "n" */
++    0xf9, 0x93, 0x1e, 0x3c, 0x78, 0xf1, 0xe3,
++
++    /* U+006F "o" */
++    0x38, 0x93, 0x36, 0x3c, 0xd9, 0xb3, 0x1c,
++
++    /* U+0070 "p" */
++    0xd9, 0xdb, 0x16, 0x3c, 0xd9, 0xb2, 0x7c, 0xc1,
++    0x83, 0x0,
++
++    /* U+0071 "q" */
++    0x3d, 0xb6, 0xf3, 0x4d, 0xb2, 0xcf, 0xc, 0x30,
++    0xc0,
++
++    /* U+0072 "r" */
++    0xdc, 0xc9, 0x9b, 0x6, 0xc, 0x18, 0x78,
++
++    /* U+0073 "s" */
++    0x7d, 0xc, 0x1e, 0x8, 0x30, 0xbe,
++
++    /* U+0074 "t" */
++    0x30, 0xc3, 0x3f, 0x30, 0xc3, 0xc, 0x30, 0xc1,
++    0xc0,
++
++    /* U+0075 "u" */
++    0xcf, 0x3c, 0xf3, 0xcf, 0x34, 0xdf,
++
++    /* U+0076 "v" */
++    0xc7, 0x9b, 0x33, 0xc7, 0x87, 0xc, 0x18,
++
++    /* U+0077 "w" */
++    0xd7, 0xaf, 0x5b, 0xa7, 0x4d, 0x9b, 0x36,
++
++    /* U+0078 "x" */
++    0xcd, 0x27, 0x8c, 0x79, 0xe7, 0xb3,
++
++    /* U+0079 "y" */
++    0xc6, 0xd9, 0xb3, 0x67, 0xcf, 0x6, 0xc, 0x10,
++    0x41, 0x80,
++
++    /* U+007A "z" */
++    0xfc, 0x61, 0x98, 0xc3, 0xc, 0x3f,
++
++    /* U+007B "{" */
++    0x19, 0x18, 0xc6, 0x31, 0x9c, 0x63, 0x18, 0xc6,
++    0xc,
++
++    /* U+007C "|" */
++    0xff, 0xff, 0xff, 0xfc,
++
++    /* U+007D "}" */
++    0xe3, 0x18, 0xc6, 0x31, 0x83, 0x63, 0x18, 0xc6,
++    0x70,
++
++    /* U+007E "~" */
++    0x66, 0xed, 0xde, 0xed, 0xdb, 0x0
++};
++
++
++/*---------------------
++ *  GLYPH DESCRIPTION
++ *--------------------*/
++
++static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
++    {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0} /* id = 0 reserved */,
++    {.bitmap_index = 0, .adv_w = 128, .box_w = 1, .box_h = 1, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 1, .adv_w = 128, .box_w = 2, .box_h = 11, .ofs_x = 3, .ofs_y = 0},
++    {.bitmap_index = 4, .adv_w = 128, .box_w = 5, .box_h = 3, .ofs_x = 2, .ofs_y = 10},
++    {.bitmap_index = 6, .adv_w = 128, .box_w = 7, .box_h = 10, .ofs_x = 1, .ofs_y = 1},
++    {.bitmap_index = 15, .adv_w = 128, .box_w = 7, .box_h = 15, .ofs_x = 1, .ofs_y = -2},
++    {.bitmap_index = 29, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 39, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 49, .adv_w = 128, .box_w = 2, .box_h = 3, .ofs_x = 3, .ofs_y = 10},
++    {.bitmap_index = 50, .adv_w = 128, .box_w = 3, .box_h = 14, .ofs_x = 3, .ofs_y = -1},
++    {.bitmap_index = 56, .adv_w = 128, .box_w = 4, .box_h = 14, .ofs_x = 2, .ofs_y = -1},
++    {.bitmap_index = 63, .adv_w = 128, .box_w = 6, .box_h = 8, .ofs_x = 1, .ofs_y = 2},
++    {.bitmap_index = 69, .adv_w = 128, .box_w = 6, .box_h = 8, .ofs_x = 1, .ofs_y = 2},
++    {.bitmap_index = 75, .adv_w = 128, .box_w = 2, .box_h = 6, .ofs_x = 3, .ofs_y = -3},
++    {.bitmap_index = 77, .adv_w = 128, .box_w = 4, .box_h = 1, .ofs_x = 2, .ofs_y = 5},
++    {.bitmap_index = 78, .adv_w = 128, .box_w = 2, .box_h = 3, .ofs_x = 3, .ofs_y = 0},
++    {.bitmap_index = 79, .adv_w = 128, .box_w = 7, .box_h = 14, .ofs_x = 1, .ofs_y = -1},
++    {.bitmap_index = 92, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 101, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 110, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 119, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 128, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 138, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 147, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 156, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 165, .adv_w = 128, .box_w = 5, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 172, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 181, .adv_w = 128, .box_w = 2, .box_h = 10, .ofs_x = 3, .ofs_y = 0},
++    {.bitmap_index = 184, .adv_w = 128, .box_w = 2, .box_h = 13, .ofs_x = 3, .ofs_y = -3},
++    {.bitmap_index = 188, .adv_w = 128, .box_w = 5, .box_h = 11, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 195, .adv_w = 128, .box_w = 5, .box_h = 4, .ofs_x = 2, .ofs_y = 4},
++    {.bitmap_index = 198, .adv_w = 128, .box_w = 5, .box_h = 11, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 205, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 214, .adv_w = 128, .box_w = 6, .box_h = 13, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 224, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 234, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 244, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 254, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 264, .adv_w = 128, .box_w = 5, .box_h = 11, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 271, .adv_w = 128, .box_w = 5, .box_h = 11, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 278, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 288, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 298, .adv_w = 128, .box_w = 4, .box_h = 11, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 304, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 313, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 323, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 332, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 342, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 351, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 361, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 371, .adv_w = 128, .box_w = 7, .box_h = 14, .ofs_x = 1, .ofs_y = -3},
++    {.bitmap_index = 384, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 394, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 404, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 414, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 424, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 434, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 444, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 454, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 464, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 473, .adv_w = 128, .box_w = 3, .box_h = 14, .ofs_x = 3, .ofs_y = -1},
++    {.bitmap_index = 479, .adv_w = 128, .box_w = 7, .box_h = 14, .ofs_x = 1, .ofs_y = -1},
++    {.bitmap_index = 492, .adv_w = 128, .box_w = 3, .box_h = 14, .ofs_x = 2, .ofs_y = -1},
++    {.bitmap_index = 498, .adv_w = 128, .box_w = 7, .box_h = 6, .ofs_x = 1, .ofs_y = 5},
++    {.bitmap_index = 504, .adv_w = 128, .box_w = 7, .box_h = 1, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 505, .adv_w = 128, .box_w = 3, .box_h = 3, .ofs_x = 2, .ofs_y = 10},
++    {.bitmap_index = 507, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 514, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 524, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 531, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 540, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 547, .adv_w = 128, .box_w = 5, .box_h = 11, .ofs_x = 2, .ofs_y = 0},
++    {.bitmap_index = 554, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = -3},
++    {.bitmap_index = 564, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 574, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 583, .adv_w = 128, .box_w = 4, .box_h = 14, .ofs_x = 2, .ofs_y = -3},
++    {.bitmap_index = 590, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 600, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 609, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 616, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 623, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 630, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = -3},
++    {.bitmap_index = 640, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 1, .ofs_y = -3},
++    {.bitmap_index = 649, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 656, .adv_w = 128, .box_w = 6, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 662, .adv_w = 128, .box_w = 6, .box_h = 11, .ofs_x = 0, .ofs_y = 0},
++    {.bitmap_index = 671, .adv_w = 128, .box_w = 6, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 677, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 684, .adv_w = 128, .box_w = 7, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 691, .adv_w = 128, .box_w = 6, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 697, .adv_w = 128, .box_w = 7, .box_h = 11, .ofs_x = 1, .ofs_y = -3},
++    {.bitmap_index = 707, .adv_w = 128, .box_w = 6, .box_h = 8, .ofs_x = 1, .ofs_y = 0},
++    {.bitmap_index = 713, .adv_w = 128, .box_w = 5, .box_h = 14, .ofs_x = 2, .ofs_y = -1},
++    {.bitmap_index = 722, .adv_w = 128, .box_w = 2, .box_h = 15, .ofs_x = 3, .ofs_y = -2},
++    {.bitmap_index = 726, .adv_w = 128, .box_w = 5, .box_h = 14, .ofs_x = 2, .ofs_y = -1},
++    {.bitmap_index = 735, .adv_w = 128, .box_w = 7, .box_h = 6, .ofs_x = 1, .ofs_y = 3}
++};
++
++/*---------------------
++ *  CHARACTER MAPPING
++ *--------------------*/
++
++
++
++/*Collect the unicode lists and glyph_id offsets*/
++static const lv_font_fmt_txt_cmap_t cmaps[] =
++{
++    {
++        .range_start = 32, .range_length = 95, .glyph_id_start = 1,
++        .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
++    }
++};
++
++
++
++/*--------------------
++ *  ALL CUSTOM DATA
++ *--------------------*/
++
++#if LV_VERSION_CHECK(8, 0, 0)
++/*Store all the custom data of the font*/
++static  lv_font_fmt_txt_glyph_cache_t cache;
++static const lv_font_fmt_txt_dsc_t font_dsc = {
++#else
++static lv_font_fmt_txt_dsc_t font_dsc = {
++#endif
++    .glyph_bitmap = glyph_bitmap,
++    .glyph_dsc = glyph_dsc,
++    .cmaps = cmaps,
++    .kern_dsc = NULL,
++    .kern_scale = 0,
++    .cmap_num = 1,
++    .bpp = 1,
++    .kern_classes = 0,
++    .bitmap_format = 0,
++#if LV_VERSION_CHECK(8, 0, 0)
++    .cache = &cache
++#endif
++};
++
++
++/*-----------------
++ *  PUBLIC FONT
++ *----------------*/
++
++/*Initialize a public general font descriptor*/
++#if LV_VERSION_CHECK(8, 0, 0)
++const lv_font_t taskfont20 = {
++#else
++lv_font_t taskfont20 = {
++#endif
++    .get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,    /*Function pointer to get glyph's data*/
++    .get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,    /*Function pointer to get glyph's bitmap*/
++    .line_height = 16,          /*The maximum line height required by the font*/
++    .base_line = 3,             /*Baseline measured from the bottom of the line*/
++#if !(LVGL_VERSION_MAJOR == 6 && LVGL_VERSION_MINOR == 0)
++    .subpx = LV_FONT_SUBPX_NONE,
++#endif
++#if LV_VERSION_CHECK(7, 4, 0) || LVGL_VERSION_MAJOR >= 8
++    .underline_position = -2,
++    .underline_thickness = 1,
++#endif
++    .dsc = &font_dsc           /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */
++};
++
++
++
++#endif /*#if TASKFONT20*/
++
+diff --git a/main/src/Theme/theme.h b/main/src/Theme/theme.h
+index 8c37cf8..806d9fd 100644
+--- a/main/src/Theme/theme.h
++++ b/main/src/Theme/theme.h
+@@ -8,6 +8,9 @@ LV_FONT_DECLARE(devin);
+ LV_FONT_DECLARE(devin2);
+ LV_FONT_DECLARE(landerfont);
+ LV_FONT_DECLARE(batteryFont);
++LV_FONT_DECLARE(taskfont12);   // VT323 12px, ASCII
++LV_FONT_DECLARE(taskfont20);   // VT323 20px, ASCII
++LV_FONT_DECLARE(facetime36);   // VT323 36px, digits + ':'
+ 
+ lv_theme_t* theme_init(lv_disp_t* disp);
+ 
+diff --git a/spiffs_image/theme1/menu/rover.bin b/spiffs_image/theme1/menu/rover.bin
+index 5ae6a7a1fe614fc6c5a25d7866fb9aa7fc95af0f..e08c347ce64ea34b3ad9c4d54b69be490c4ea35c 100644
+GIT binary patch
+literal 1636
+zcmc(eOAduF2t{FH@@8}iF7EAr2?}kg{h&lmY6k^-(hFSm2kQc|{@WJgryB+>A4s!0
+zBI*-O=NN|7^dPNu{k`V3K-6#jX-p{As6_yC`Cw0&TmP6_v#vg}oowI{ZgQ0^vAbW+
+zH8Hu^l;5k#g*jX%kk#E!gE1pYW7?b$Y@S6~#@1Kv_IG*Tn?F^FyV?KO@9(_7ilp?s
+X|3}=@f61NycTnep{GDWE2t=|2D%}yr
+
+literal 1636
+zcmbu9O?Cqz41;0Q_qu~4^l-WV5fXjExJ)t`7ULxIBVk$Cw7=!=rx1_l)Aw7K+8yni
+zNQJ272H&sqYj2nOJHBl6@A}{LNAk@*qRx42_};3va1opQ>-w6n^wr}pvE!At)bD3b
+z2k#<0)_N>P11ZjxUt9D9yLryglPEr`K=SGmHCkH@9rLwTi{yZM5t(mgq$My(8F~*C
+zGd~|@g1u=6v8QuhXlSfFQ`Q`8fTBpE6T!Y16MqdE%cE^C?oFNXfqn4QCtp9pyiMf$
+z0pew8q=(8S(w+Z5$uV=@7hZ2;bFI2#>f7O{&!uIan0dFqcX3<Jlz9j^-hk>PrK>7>
+zO*qj_Uxh&9+OdJ)=>|AEH9mo%&lueV<_49(@QjLmYHB_j3AiZBIgr#CqfcP+5;ad1
+o>jx0L>yd8*_6d}Mefu9<u!ezHp`~Lr3&9eI1@m76{c{+20iP}stN;K2
+
+diff --git a/spiffs_image/theme2/menu/rover.bin b/spiffs_image/theme2/menu/rover.bin
+index 874839145fc83c80928bd7443470b14213248f99..1e43577405b92657d14969cdb6c63efb52d891a4 100644
+GIT binary patch
+literal 1636
+zcmd;NP-J5Of(SFy|Ahg~|C_QB|KC1)^gl?9{(w;sW~ZP4jD<`yGQxNQbeCro!~iI6
+zU{q34Qd9&IU?3y}q$rj*fO!{4gUuI&8m}Y>HXmIcCJUtn=qis9Jc6k9yI=r1%R8I6
+zxEQ;*ASg8Z5fV^kX!6u?KPZ?)AVy&|A0$UW-VwVz#Qi`y5fO+t(aeX+i#WPqmxnk?
+z1ZX;T^I`G?-G^5{A^$^c0h3tWKhW`q+kHqf5GHQ-lO<2cd<x|W<X@zs2+l+<Ul<sS
+IF#tp!0Otv@h5!Hn
+
+literal 1636
+zcmbu7yKdA#6o!vI4iN<s8#k0@Ce&CNd$%>LT_P<)BhmueMWR|_L0S|_9)LID4Jh*j
+zJdF9znX%(dvR))k;miM>`^-an`hZ{^?9cV@?$^&B-PNae-TA!io<DlhUA@|NpI6^I
+z_W1{!X|0Xj>lj(s+<n{U5Fg~5>G=8P{bc?_+-}Tdyw%h75A;tPv3=vSUb`tuWa>$7
+ztUaG}_^<pC#<%7E^HV(k1mB%+cHc#@GGC;1M(JCkD9U!mIni38iX~P7p6176&KIoS
+zvZ92?){y)LC%$09)smtUlbbWUlVIS8kF2|}*yp&wn8((&XBc-iG%!PVV>2bf9lG=;
+zx1To@ta#b9*wz-qYWBF7b9hoW%;WmTUg)~kr%j7+LXkrFsCHUjXj3$8sD328FO0V-
+z+XDOx!rAWdXU_A`d~!Q}arr^w!*YdV8G|itS=gevl<b%Q?^q4(FC9K#pVm!(Hq5gl
+z7wpY^jjwdE4&6z7OtgcYS*(ZEB0dYHNag<P<JVrnY9Axqo2tT_D16~RwHd3{=7MpL
+z30V>rSdVPUo#IX<75_uT{ga1Gj;p{tuY67gQS@FQIR*tW;Z5hLT&*}?5a>9h&nwT7
+zK{!&%(IAN3RU;>rQ?c?q2!g?pRN}dc#0Md8RP!9=h4+HzyblCO@6zWW1df?}H*jP>
+R9`dF={5vNy;UpOc;V=KgktqNG
+
+diff --git a/spiffs_image/theme3/menu/rover.bin b/spiffs_image/theme3/menu/rover.bin
+index bdabe62504ccc5a7f467b6ecb502197c2de4e460..ebff1dbe9e39313a7dd7eb244959a905382bea26 100644
+GIT binary patch
+literal 1636
+zcmd6mQ4WJJ2!_kclD%?+l?&9}|8A}YW~9=R%tXgSwfPi&{?cc9Jrc*N0juoqSTPqV
+z3z@w7`2KRboMS$O(STK&)d#2fJ^|-9{(v!|aT^!&gFX4b^cAE8)xho1`?CT4tmoF<
+zlz!sSY?5<z|8GO1gEQn+Xp5e+{-ria#BB~Z;o@^miZri}WzGZrLH{g57FYk>=Qq)}
+eL;O0{ANA++DE~<w+}}QX-Rm4E;mNj1WKKWZW;*Hs
+
+literal 1734
+zcmb_cL2kn^49k2Nu-g<P57@yU2>O7aKk)w_vy!ysI9V5CSlzBkWQw9>W*?tl?-SNH
+zR{4D^H;6F)w-vH!#qGDekZ;oza{3=4*=@j)E#9xIj1l81ujpkoF-$VeoZ8hIB9hJ7
+zu1SU*BON?_RI#hG9U+e0CVQ&6C}p|G+mQ3AB=VHWeElt_3Ce~tA@0Dj;&b$5L!iux
+zO3R{J-61pt{Jeq%ur(hJ>Wqk6ihUKyq||+(8E|<O5%>eIa(!CjrZ-LYYv6(tLV1;`
+z=Rg*8QUhi9l*CmfpvwgZnDF*=#61UF5P^46i|uenw3+`vNC&E*5m$|Lyl>@+ePR%Y
+z5Fc^SjtD$*{<sR|bPg3j&j$o(>eS~<uNs_zp?F<f8@w=(*Hsb~kXGToLCy|R-y@Wn
+zi%2tU<6QjBsCZoPEftlo|2N{U2+oH)>|0O|Fo`mF#PXa*E?ev-lsq!Y{5(-wyam_{
+z7decc1Ba~90%e~F)V&jdS+Ug?*bx!}1pGsHKrw}Mb48HqL55bi;Q{9;JN-Na?I`FF
+L)1c{CZPdU6D~gDR
+
+diff --git a/spiffs_image/theme4/menu/rover.bin b/spiffs_image/theme4/menu/rover.bin
+index a1d596b0404691c6d5d64e626f1a5fbcbe05ab52..5a27f714fb04f92ec774339aa350cedd134c3250 100644
+GIT binary patch
+literal 1636
+zcmc(eO%8-G2!&xYi933P*|_l<bN?&NKwD~maEO}JE(H6f4|vrD-Y?+w+19VbXBP&o
+zA4s!0BI+AW=NN|7^dPNu{oUrZK-6#jX-p{As6_yC`Cw0&TYsNhv#vg}oowJ9PI8qk
+zu{&S(H8Hu^l<(E#!W=FW$m-6g!I%-HF>Ou=HqW9gW9ut-`}=#|n?F^FPqY80@9((3
+bilp?o|4ZD{zsa5dcTnez{GDWE2t@J&2pSOg
+
+literal 1636
+zcmbu9J$Az|41=Ym?{$-o(4|YSk^5gM#RpNWoI2KE=EpW5f)J_XvwVFN#pCDu$@N~;
+z?r85+Dnu<e_<o&Vd%M)%@nxfb*Z-zJl5g%2b<ShM_g1xqi`e8}*VlZduO7dN9j~;d
+zem`?Mco*Te)?+amNO8XTv_(&_o97JOiQ=^iB(E+}qqWu0F<)!7NDinMk@;3eS^|@l
+zq1Qk$^YdmV*qe3`dphTZhQ`V>WzE3`D2gOH5$uaG@oUIfZf$#UZ|aN>>>p2k^7SFi
+z+eAJeARd-RdZ>Iwy7T`gIcCoD!s}^lu2pwTeLEcWxwOm^Gq3jdDsIb}G7kaA8&I93
+zbX7&K2`9Sftq^EjJ2ntJ-2i8&#wRfJ8KaxP+@KN|o>8$+P0dFm0T*RC2a+0N^a)H}
+rqUNb${Q!b@J@Re9K7lf@Z~tQp)-Vt&v~;XyAy@*jVE#4GKZk)|d}|Ti
+
+diff --git a/spiffs_image/theme5/menu/rover.bin b/spiffs_image/theme5/menu/rover.bin
+index befbb772abda081bfd5773995f3b0d521b75c0e7..47f2f9d58e37863bc11a6b169f2aa961dac2df9d 100644
+GIT binary patch
+literal 1636
+zcmc(eQ4Yf(2!>$~P4<R2a6axJJH&3Vo9xz|L`@OsOuEdHG_`yR|4-X1+!o03xTp2~
+zdak@aFEF&;f!a#m5!(|@=NL?M8d#dr_cM>pF4yL(pATs+w)1i>H{%I&`z!O-|0Mz>
+zfbFLAZJ=&b+%!1Ec}(@gaL+RvaP)c6pBYiHsp?lw2tF_VC|CFEH$K$&_58@cn6j(?
+l?Dw~?PmnsQC{ied*Yv(W_q-_f4?g&RP4}FLT{4*{`~ze&86p4x
+
+literal 1700
+zcmbu9InER@5QWROghXbK6A~nkD<eQ&?!Y0)2)PNj{`tzi%=|(<NKip9@A=i<{ZW2=
+z5bW2_?{D9})VHsnKEK)fznQPg%9T3IW$ltrSWefxRFNRpyr1PIA7=Y6-p%+@FX?rD
+z)*h|b`TwOqE~TDRidX#;sV&f=Ynv_1YgQz+KnYjotNE|xif6v~r^grep09soN`1tq
+zJ^~e)Wa|C<V0EaeR*;@WRL65HZw*A@CWAund(Y1fa83vmDZ}NWG2fpZ1aoFQT_VQl
+z!wsUGcJeL@zGloN>&e<|v0)dr=Pquze()=~ZNkU32o5~Q?aWHf5<JYl1UEW~teLIg
+zyEBiXs->FaJyVV8E$(JTXQ{Kp`%WKr{SlQ3_0(pM@EXO!E&UOf2{dWer-pn{=ViT$
+z43^k<<R|rLg!nvf#*e*tOWm&`)^V>c1&@>|Ei+!vMteo(Y_hwYZ;nFt`U>=o{pd7~
+z5QknPLpK}RGq*N09PY&xD`cxL_sE{5TkiL?%SA`9Oz?{HwSJ;54g>56t8%v+&I7b4
+zONPH(0gMmPStiQQ>kjREN`t$b0LA#?;e8*B)6M}JegbY-9|PO8n$X?w9l;4mwnl`t
+z3_LW+%7h+(IOM$QjMmBK*XSPr7#8>%z-(&SM*jd7ErGA0D9^(ZF#Z5Go=s*Oc}7hF
+n)OP?IPd_RY_^5X~cLF=lfEFyw$Ij899oP>Xzc%KxAq)5o?wnM@
+
+diff --git a/spiffs_image/theme6/menu/rover.bin b/spiffs_image/theme6/menu/rover.bin
+index 490fd00d1b750dbb294f629aa4b4601a021ef4b2..8abc0061dbf1e8523025a18d1d6231514f05cbdc 100644
+GIT binary patch
+literal 1636
+zcmc(eO%i}02!&zOOglV6_djHTiupq^)r`3i@*5xUsui{cWbL@e`0Iv2%Lme|j)?k1
+z(>aD=H9bgcU4Nf>EfDove;N~tHEI#STt3(n=GH&w)~u_KY$qFdhKF2bOYH8Kb4^Sx
+zHs$wfa$yda31oHm(_qYq(wH_U1e<43ma+AfyZznX_vTMk;%@f;_xro<uOcbE?*A3{
+T^gnXv{~gr%Ab%$r83K_Uup$v+
+
+literal 1636
+zcmbu9OLD_73`5OLXS$P)(EA@U#e*nTP91AuCh-RlL5NiQef)eK#4BFDKe|MBv`-=d
+z5yu0*-{(hfxB5H&*yum?zv++Un|nl^>)7zUg|=`LoBaFwny>WL;}5apmA2IHS561-
+zB0NT%i_t)ebLH0-J;83CGxQ{i&ni&7x<rlERzv4}t<@qqpk7AhTN!ByOj3s41I5a(
+zhnZk++ClE=nirZHE6<cQ2OFR$lIUcxFUG`QL&frF+lzZsSA1gsc<Pg{A7S1m>iq=q
+zvNX~|<&x>n|C{8PIqwUvx3Rev?wI;^I_h)jF;C3A+uysmEmz7s1RQTbb&}Gdie8gW
+zbkkQM(71MNAbGk0&Q6U_VCXYOH-Wi96)-%bVxO9tk46D5%5n}QHOA-*n7l;IQ^ooT
+mB=36U+kkxnRbb!##}=$%AXjMVSj|GP0&>Cp*FgUq27Un~f)Ypo
+
+diff --git a/spiffs_image/theme7/menu/rover.bin b/spiffs_image/theme7/menu/rover.bin
+index 1bfca6e04235fcfa3bbb3cb7b50863a519a8b8fa..117a89bebdc79c587a3dbd1e909ac7c460926c07 100644
+GIT binary patch
+literal 1636
+zcmc(eO%B8$2!&xY$?Wh5bN@qHQ1O=zX`5IVLjB?cUfVDHJ|HW`nBuD&1}z^*vpyo~
+z6K&@hmNoPstxf$s=Dk4DAN?6jsMe@O0DJjjPuN?(&8^u~AK6Yeu!W0UWow-7*K<uw
+zE;g0-YI0!?mkDG|_w!)Pi1L^=Cj^@pQI@gwmAn1@z3<JRtEAoR|Lym8-d{&@dfxvn
+V?&&||&i}ip^FjGe3Ni!|IRO305?}xT
+
+literal 1636
+zcmbu9O?JZ|41{5m_qu~4<o<_r=Np8IQ^zc<B>tH}qd}tmDeqSyj^ptC(WQ1r`zBH$
+zYI(r-`~2G5t^STL8~vyLH~o=(bC0NV9UH#4sx92aCjY*^<|}>m_)F|~r7iXQmD9ny
+z2#>X%i_t)ebLH0-J;83CGxQ{i&nl3-x<rlERzv4}t<@qqpk74gTN!ByOj3qE1I5hG
+zhnZk++Cl8;nim=xE6<cQ2OFR$lITRRFUG`QL&oxG+lzZsSA1aqc<Pg{A7S1m^8Ezy
+zvNX~|<r3-6|C{8PIqwUvx3Rfa-7)p;bkyh4GEdCB+ux_SEoaI+1RQTbb&}Fm6}={$
+z=%%kipmFWkK=5<}oShn<z|d!mZUS?IN?>?K#XdDPAB_ZDl;s>qYK+k*FnNiZr;7Ch
+m2;TL`w*mVE%D}$;k1bfkK&;Txv6_Wo3B-c=uYvwK4EzFeC=*5i
+
+diff --git a/spiffs_image/theme8/menu/rover.bin b/spiffs_image/theme8/menu/rover.bin
+index dfaccb5d154a11b5aabb654eba9430ba3fa6e7e5..41d5c0e77b7e41683a62d1b9d055295ba2a9e658 100644
+GIT binary patch
+literal 1636
+zcmc(eQ4Yc|2!_E26W{0!>Q3QlJcC#CWV2YBQD8RF*frVO@wM>(Y`ehq3_PCq6&|<s
+zy*})Qsg+LDR(eKkPc)rla--A0(u}^Jd2V(&H(z~!$a1xvmvgymPnuibnD_oq8DIg}
+zCZlfyvdwT;;498;k`E(1&uqXk=2d@TMAfFrFPso!Uj0$Y9_Md-sPE(Xk$=_YQ2){I
+jZ(pAx(yFXNsDw*+-(PrMCHn^-{J*Yx3FI!gxKa5F+4dO>
+
+literal 1685
+zcmbu8>utj@41{?=QJ_Dq38*bPO=sweovi&%FRMio1I;<1De`#K%Wp6BHH@#1@A!QG
+zZvMZGj)rnqKuJpZ6yeCn3iT*Y67s4=#<Q!q+9(<nxy=Jy5so4j@(5Q77jxjaX~A~i
+z!zF>jZ4SrH>2^ZvV^{T0KW}9sWb1#~6bXkC(`xX@`S~S5xD(hew<%?x6geekDB#0N
+z)r=GJ;3VK7ai;rW?=}O8jDgcz0ZVX=$I@;S933({!H3S7v`MfbeRHfd;N|(u{FTJQ
+z?z^}VFotp(-o_*-J-R{g9IP+|LJ5o5gfjSTA&*os9de<~6bK~)n}(Ke<DDQD-caOw
+z$w{hiO?S0X)^(OB0v$6>U^Q6%ed`^iMe<h8PhhZl@dG4VHFHoh4s|(iixa9NF$095
+zgp#MGNjxxD0JjyQ)0muL%|;l3=%B#2)C&D7tU%9)5?v(()r1u*5FM&XO+pxltr>^`
+fiafVahH3_*5x{K_i45R`-<kmrjJ0w7lFq;nk-jGy
+
+diff --git a/spiffs_image/theme9/menu/rover.bin b/spiffs_image/theme9/menu/rover.bin
+index 874839145fc83c80928bd7443470b14213248f99..1e43577405b92657d14969cdb6c63efb52d891a4 100644
+GIT binary patch
+literal 1636
+zcmd;NP-J5Of(SFy|Ahg~|C_QB|KC1)^gl?9{(w;sW~ZP4jD<`yGQxNQbeCro!~iI6
+zU{q34Qd9&IU?3y}q$rj*fO!{4gUuI&8m}Y>HXmIcCJUtn=qis9Jc6k9yI=r1%R8I6
+zxEQ;*ASg8Z5fV^kX!6u?KPZ?)AVy&|A0$UW-VwVz#Qi`y5fO+t(aeX+i#WPqmxnk?
+z1ZX;T^I`G?-G^5{A^$^c0h3tWKhW`q+kHqf5GHQ-lO<2cd<x|W<X@zs2+l+<Ul<sS
+IF#tp!0Otv@h5!Hn
+
+literal 1636
+zcmbu7yKdA#6o!vI4iN<s8#k0@Ce&CNd$%>LT_P<)BhmueMWR|_L0S|_9)LID4Jh*j
+zJdF9znX%(dvR))k;miM>`^-an`hZ{^?9cV@?$^&B-PNae-TA!io<DlhUA@|NpI6^I
+z_W1{!X|0Xj>lj(s+<n{U5Fg~5>G=8P{bc?_+-}Tdyw%h75A;tPv3=vSUb`tuWa>$7
+ztUaG}_^<pC#<%7E^HV(k1mB%+cHc#@GGC;1M(JCkD9U!mIni38iX~P7p6176&KIoS
+zvZ92?){y)LC%$09)smtUlbbWUlVIS8kF2|}*yp&wn8((&XBc-iG%!PVV>2bf9lG=;
+zx1To@ta#b9*wz-qYWBF7b9hoW%;WmTUg)~kr%j7+LXkrFsCHUjXj3$8sD328FO0V-
+z+XDOx!rAWdXU_A`d~!Q}arr^w!*YdV8G|itS=gevl<b%Q?^q4(FC9K#pVm!(Hq5gl
+z7wpY^jjwdE4&6z7OtgcYS*(ZEB0dYHNag<P<JVrnY9Axqo2tT_D16~RwHd3{=7MpL
+z30V>rSdVPUo#IX<75_uT{ga1Gj;p{tuY67gQS@FQIR*tW;Z5hLT&*}?5a>9h&nwT7
+zK{!&%(IAN3RU;>rQ?c?q2!g?pRN}dc#0Md8RP!9=h4+HzyblCO@6zWW1df?}H*jP>
+R9`dF={5vNy;UpOc;V=KgktqNG
+
